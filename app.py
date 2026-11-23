@@ -22,7 +22,7 @@ app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(days=7)
 DB_PATH = os.environ.get("DB_PATH", "fampay.db")
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 BASE_URL = os.environ.get("BASE_URL", "")
-APP_VERSION = "4.0.0"
+APP_VERSION = "5.0.0"
 BUILD_DATE = "2025"
 BOOT_TIME = time.time()
 
@@ -184,75 +184,48 @@ def notify_webhook(username, event, payload):
             import urllib.request
             body = json.dumps({"event": event, "data": payload, "ts": time.time()}).encode()
             req = urllib.request.Request(u['webhook_url'], data=body,
-                                          headers={"Content-Type":"application/json","User-Agent":"FamPay-AutoQR/4.0"})
+                                          headers={"Content-Type":"application/json","User-Agent":"FamPay-AutoQR/5.0"})
             urllib.request.urlopen(req, timeout=3)
     except: pass
 
 # ==========================================
-# ⚡ FLASH SPEED EMAIL CHECK (V4)
-# 1) Narrow window 2 minutes (default)
-# 2) Fetches only LAST 5 UNSEEN
-# 3) Strips "Hey <name>" and "Updated Balance" lines from body
-# 4) Extract sender name + UPI for professional display
+# ⚡ FLASH SPEED EMAIL CHECK (V5)
 # ==========================================
 def strip_personal_lines(body):
-    """Remove personal/greeting lines: 'Hey ...', 'Updated Balance: ₹X'"""
     lines = body.split('\n')
     cleaned = []
     for line in lines:
         t = line.strip()
-        # Skip greeting lines
         if re.match(r'^hey\s+[a-z\s]+[,\.]?$', t, re.I):
             continue
-        # Skip "Updated Balance" lines
         if re.match(r'^updated\s+balance\s*[:\-]?', t, re.I):
             continue
-        if re.match(r'^₹\s?[\d,]+\.?\d*$', t) and 'balance' in body.lower():
-            # Might be balance-only, skip only if adjacent to 'Updated Balance'
-            # to avoid removing the payment amount
-            pass
         cleaned.append(line)
     return '\n'.join(cleaned)
 
 def extract_sender(body):
-    """Extract sender name + UPI from email like 'from xxx@upi'"""
     sender_name = ''
     sender_upi = ''
     m = re.search(r'from\s+([a-z0-9._\-]+)@([a-z0-9.\-]+)', body, re.I)
     if m:
         sender_upi = f"{m.group(1)}@{m.group(2)}"
-    # "You have successfully received ₹X from Name <upi>" style
     m2 = re.search(r'received\s+.*?from\s+([^\n]+?)(?:\n|$)', body, re.I)
     if m2:
         line = m2.group(1).strip()
-        # try to isolate name (before <upi> or before @)
         name_part = re.split(r'[<@]', line)[0].strip()
         if name_part:
             sender_name = name_part
     if not sender_upi:
-        # Try standalone UPI
         m3 = re.search(r'([a-z0-9._\-]+@[a-z0-9.\-]+)', body, re.I)
         if m3: sender_upi = m3.group(1)
     return sender_name[:60], sender_upi[:80]
 
 def extract_email_date(body):
-    """Extract 'Date : 10:54 AM IST, 05 November 2026' line"""
     m = re.search(r'Date\s*[:\-]\s*([^\n]+)', body, re.I)
     if m: return m.group(1).strip()[:100]
     return ''
 
 def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, window_minutes=2):
-    """
-    FLASH-SPEED email check:
-      - Only last `window_minutes` window (default 2 min)
-      - Only last 5 UNSEEN mails fetched
-      - Personal lines (Hey..., Updated Balance) stripped
-    Returns:
-      (True,  {txn data}, "PAID")
-      (False, {partial data}, "PARTIAL")
-      (False, None, "NO_EMAIL")
-      (False, None, error)
-    """
     db = get_db()
     u = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     if not u or not u['email'] or not u['app_password']:
@@ -277,7 +250,6 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
             mail.logout()
             return False, None, "NO_EMAIL"
 
-        # Only fetch LAST 5 mails — flash speed
         latest_ids = email_ids[-5:]
 
         for e_id in reversed(latest_ids):
@@ -295,32 +267,24 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
                 except: continue
 
                 raw_body = clean_body(msg)
-
-                # Strip personal lines BEFORE amount extraction
                 body = strip_personal_lines(raw_body)
 
-                # amount extraction — use cleaned body
                 am = re.search(r'₹\s?([\d,]+\.?\d*)', body)
                 if not am: continue
                 recv = float(am.group(1).replace(",", ""))
 
-                # txn id
                 txn_m = re.search(r'Transaction ID\s*[:\-]?\s*([A-Z0-9]+)', body, re.I)
                 txn_id = txn_m.group(1) if txn_m else f"AUTO{int(time.time())}{random.randint(100,999)}"
 
-                # UTR
                 utr_m = re.search(r'UTR\s*[:\-]?\s*(\d+)', body, re.I)
                 utr = utr_m.group(1) if utr_m else ""
 
-                # sender name + upi
                 sender_name, sender_upi = extract_sender(raw_body)
 
-                # email date
                 email_date = extract_email_date(raw_body)
                 if not email_date:
                     email_date = dt.strftime("%d %b %Y, %I:%M %p IST")
 
-                # duplicate block
                 dup = db.execute("SELECT id FROM transactions WHERE txn_id=?", (txn_id,)).fetchone()
                 if dup:
                     mail.store(e_id, '+FLAGS', '\\Seen')
@@ -614,7 +578,9 @@ def gen_key_api():
     return jsonify({"status":"success", "api_key": key, "expiry": expiry,
         "api_url": build_url(f"/v2/fam/{key}"),
         "example": build_url(f"/v2/fam/{key}?qr=100"),
-        "check_url": build_url(f"/api/v2/check/{key}")})
+        "check_url": build_url(f"/api/v2/check/{key}"),
+        "telegram_url": build_url(f"/api/integration/telegram/{key}"),
+        "website_url": build_url(f"/api/integration/website/{key}")})
 
 @app.route('/api/list-keys', methods=['GET'])
 @login_required
@@ -627,7 +593,9 @@ def list_keys():
         "total_received": round(r['total_received'],2),
         "rate_limit": r['rate_limit'],
         "url": build_url(f"/v2/fam/{r['api_key']}"),
-        "check_url": build_url(f"/api/v2/check/{r['api_key']}")
+        "check_url": build_url(f"/api/v2/check/{r['api_key']}"),
+        "telegram_url": build_url(f"/api/integration/telegram/{r['api_key']}"),
+        "website_url": build_url(f"/api/integration/website/{r['api_key']}")
     } for r in rows])
 
 @app.route('/api/delete-key/<api_key>', methods=['DELETE'])
@@ -679,7 +647,7 @@ def audit_log():
     } for r in rows])
 
 # ==========================================
-# PAYMENT VERIFICATION
+# PAYMENT VERIFICATION (V5 — Partial-safe)
 # ==========================================
 def _key_status(key):
     db = get_db()
@@ -747,7 +715,7 @@ def _verify_payment_for_session(s, key_row, tolerance=0.0):
     return False, None, status or "PENDING"
 
 # ==========================================
-# PUBLIC QR
+# PUBLIC QR (V5 — with integration links)
 # ==========================================
 @app.route('/v2/fam/<path:api_key>')
 def fam_qr(api_key):
@@ -790,16 +758,68 @@ def fam_qr(api_key):
     audit(key_row['username'], "QR_GENERATED", f"order={order_id} amt={amount}")
 
     qr_image = qr_b64(upi)
+    
+    telegram_url = build_url(f"/api/integration/telegram/{key_row['api_key']}")
+    website_url = build_url(f"/api/integration/website/{key_row['api_key']}")
+    check_url = build_url(f"/api/v2/check/{key_row['api_key']}?order_id={order_id}")
+    
     return render_template_string(
-        QR_HTML_TEMPLATE_V4,
+        QR_HTML_TEMPLATE_V5,
         amount=amount, qr_b64=qr_image, order_id=order_id,
         upi_id=user['upi_id'], full_name=user['full_name'] or user['username'],
         minutes=minutes, tolerance=user['tolerance'] or 0,
-        brand=APP_VERSION
+        brand=APP_VERSION,
+        api_key=key_row['api_key'],
+        telegram_url=telegram_url,
+        website_url=website_url,
+        check_url=check_url
     )
 
 # ==========================================
-# JSON CHECK
+# INTEGRATION PAGES (V5 NEW)
+# ==========================================
+@app.route('/api/integration/telegram/<api_key>')
+def integration_telegram(api_key):
+    key_row, status = _key_status(api_key)
+    if status != "active":
+        return render_template_string(ERROR_HTML, msg="❌ Invalid Key"), 403
+    
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE username=?", (key_row['username'],)).fetchone()
+    base = build_url("")
+    
+    return render_template_string(
+        INTEGRATION_TELEGRAM_HTML,
+        api_key=api_key, base=base,
+        qr_url=f"{base}/v2/fam/{api_key}?qr=AMOUNT",
+        check_url=f"{base}/api/v2/check/{api_key}?order_id=ORDER_ID",
+        username=key_row['username'],
+        brand=APP_VERSION,
+        upi_id=user['upi_id'] if user else ''
+    )
+
+@app.route('/api/integration/website/<api_key>')
+def integration_website(api_key):
+    key_row, status = _key_status(api_key)
+    if status != "active":
+        return render_template_string(ERROR_HTML, msg="❌ Invalid Key"), 403
+    
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE username=?", (key_row['username'],)).fetchone()
+    base = build_url("")
+    
+    return render_template_string(
+        INTEGRATION_WEBSITE_HTML,
+        api_key=api_key, base=base,
+        qr_url=f"{base}/v2/fam/{api_key}?qr=AMOUNT",
+        check_url=f"{base}/api/v2/check/{api_key}?order_id=ORDER_ID",
+        username=key_row['username'],
+        brand=APP_VERSION,
+        upi_id=user['upi_id'] if user else ''
+    )
+
+# ==========================================
+# JSON CHECK (V5)
 # ==========================================
 @app.route('/api/v2/check/<path:api_key>')
 def api_check_v2(api_key):
@@ -820,21 +840,33 @@ def api_check_v2(api_key):
         return jsonify({"status": "NOTFOUND"})
 
     if s['status'] == 'PAID':
+        t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
         return jsonify({
             "status": "PAID", "order_id": s['order_id'],
             "amount": s['paid_amount'] or s['amount'],
             "expected": s['amount'], "paid": s['paid_amount'] or s['amount'],
             "txn_id": s['txn_id'], "utr": s['utr'],
+            "sender_name": t['sender_name'] if t else '',
+            "sender_upi": t['sender_upi'] if t else '',
+            "email_date": t['email_date'] if t else '',
             "verified": True
         })
 
     if s['status'] == 'PARTIAL':
+        short = s['short_by'] or 0
+        over = s['overpaid'] or 0
+        msg = ""
+        if short > 0:
+            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f}. Please pay remaining ₹{short:.2f} to complete."
+        elif over > 0:
+            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f} — overpaid by ₹{over:.2f}."
         return jsonify({
             "status": "PARTIAL", "order_id": s['order_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": s['short_by'], "overpaid": s['overpaid'],
+            "short_by": short, "overpaid": over,
             "txn_id": s['txn_id'], "utr": s['utr'], "verified": False,
-            "message": f"Please pay remaining ₹{s['short_by']:.2f}" if s['short_by'] > 0 else f"Overpaid ₹{s['overpaid']:.2f}"
+            "message": msg,
+            "qr_still_active": time.time() <= s['expires_at']
         })
 
     if s['status'] == 'EXPIRED' or time.time() > s['expires_at']:
@@ -849,16 +881,32 @@ def api_check_v2(api_key):
     s = db.execute("SELECT * FROM qr_sessions WHERE order_id=?", (s['order_id'],)).fetchone()
 
     if s['status'] == 'PAID':
+        t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
         return jsonify({
             "status": "PAID", "order_id": s['order_id'],
             "amount": s['paid_amount'], "expected": s['amount'],
-            "txn_id": s['txn_id'], "utr": s['utr'], "verified": True
+            "txn_id": s['txn_id'], "utr": s['utr'],
+            "sender_name": t['sender_name'] if t else '',
+            "sender_upi": t['sender_upi'] if t else '',
+            "email_date": t['email_date'] if t else '',
+            "verified": True
         })
     if s['status'] == 'PARTIAL':
+        short = s['short_by'] or 0
+        over = s['overpaid'] or 0
+        msg = ""
+        if short > 0:
+            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f}. Please pay remaining ₹{short:.2f} to complete."
+        elif over > 0:
+            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f} — overpaid by ₹{over:.2f}."
         return jsonify({
             "status": "PARTIAL", "order_id": s['order_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": s['short_by'], "verified": False
+            "short_by": short, "overpaid": over,
+            "txn_id": s['txn_id'], "utr": s['utr'],
+            "verified": False,
+            "message": msg,
+            "qr_still_active": time.time() <= s['expires_at']
         })
 
     return jsonify({
@@ -874,7 +922,6 @@ def check_payment(order_id):
         return jsonify({"status": "NOTFOUND"}), 404
 
     if s['status'] == 'PAID':
-        # fetch full txn details
         t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
         return jsonify({"status": "PAID", "txn": {
             "txn_id": s['txn_id'], "utr": s['utr'],
@@ -886,10 +933,19 @@ def check_payment(order_id):
         }})
 
     if s['status'] == 'PARTIAL':
+        short = s['short_by'] or 0
+        over = s['overpaid'] or 0
+        msg = ""
+        if short > 0:
+            msg = f"⚠️ Short by ₹{short:.2f}. Please pay remaining amount."
+        elif over > 0:
+            msg = f"⚠️ Overpaid by ₹{over:.2f}."
         return jsonify({"status": "PARTIAL",
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": s['short_by'],
-            "message": f"⚠️ Short by ₹{s['short_by']:.2f}"
+            "short_by": short, "overpaid": over,
+            "txn_id": s['txn_id'], "utr": s['utr'],
+            "message": msg,
+            "qr_still_active": time.time() <= s['expires_at']
         })
 
     if time.time() > s['expires_at']:
@@ -918,9 +974,19 @@ def check_payment(order_id):
             "order_id": s['order_id']
         }})
     if s['status'] == 'PARTIAL':
+        short = s['short_by'] or 0
+        over = s['overpaid'] or 0
+        msg = ""
+        if short > 0:
+            msg = f"⚠️ Short by ₹{short:.2f}. Please pay remaining."
+        elif over > 0:
+            msg = f"⚠️ Overpaid by ₹{over:.2f}."
         return jsonify({"status": "PARTIAL",
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": s['short_by']
+            "short_by": short, "overpaid": over,
+            "txn_id": s['txn_id'], "utr": s['utr'],
+            "message": msg,
+            "qr_still_active": time.time() <= s['expires_at']
         })
     return jsonify({"status": "PENDING"})
 
@@ -953,10 +1019,9 @@ h2{color:#ff4757;margin-bottom:12px}p{color:#7a7a9a}</style></head>
 """
 
 # ==========================================
-# QR PAGE V4 — GLOWING PROFESSIONAL SUCCESS
-# No "Hey <name>" or "Updated Balance" shown
+# QR PAGE V5 — with integration links
 # ==========================================
-QR_HTML_TEMPLATE_V4 = """
+QR_HTML_TEMPLATE_V5 = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pay ₹{{ amount }}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -969,7 +1034,7 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
 background:radial-gradient(circle at 50% 50%,rgba(0,255,179,.05),transparent 70%);
 animation:pulseBg 6s ease-in-out infinite}
 @keyframes pulseBg{0%,100%{opacity:.5}50%{opacity:1}}
-.card{width:100%;max-width:440px;background:rgba(15,15,30,.85);backdrop-filter:blur(20px);
+.card{width:100%;max-width:460px;background:rgba(15,15,30,.85);backdrop-filter:blur(20px);
 border:1px solid rgba(0,255,179,.2);border-radius:24px;padding:32px 26px;
 box-shadow:0 0 60px rgba(0,224,164,.2),0 0 120px rgba(168,85,247,.15);
 text-align:center;position:relative;overflow:hidden;animation:cardIn .6s cubic-bezier(.175,.885,.32,1.275)}
@@ -1037,15 +1102,30 @@ padding:32px 26px;z-index:10;opacity:0;transition:.5s}
 background:radial-gradient(circle,rgba(255,165,2,.3),rgba(255,165,2,.05));
 border:3px solid #ffa502;display:flex;align-items:center;justify-content:center;
 font-size:50px;margin-bottom:22px;box-shadow:0 0 40px rgba(255,165,2,.7)}
-.warn-title{font-size:26px;font-weight:900;color:#ffa502;margin-bottom:8px;
+.warn-title{font-size:24px;font-weight:900;color:#ffa502;margin-bottom:8px;
 text-shadow:0 0 30px rgba(255,165,2,.5)}
-.warn-msg{color:#e8e8f5;font-size:14px;margin-bottom:18px;text-align:center;line-height:1.6}
+.warn-msg{color:#e8e8f5;font-size:14px;margin-bottom:18px;text-align:center;line-height:1.6;
+padding:10px 14px;background:rgba(255,165,2,.1);border-radius:10px;border:1px solid rgba(255,165,2,.2)}
 .warn-details{background:rgba(21,21,42,.8);backdrop-filter:blur(10px);
 border:1px solid rgba(255,165,2,.25);border-radius:14px;padding:18px;width:100%;
 font-size:13px;margin-bottom:18px;font-family:'Space Mono',monospace}
 .warn-details div{display:flex;justify-content:space-between;margin-bottom:10px}
 .warn-details div:last-child{margin-bottom:0}
 .warn-details b{color:#ffa502}
+.integration-box{margin-top:20px;text-align:left}
+.integration-title{font-size:11px;font-weight:800;color:#7a7a9a;text-transform:uppercase;
+letter-spacing:1.5px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.integration-link{background:rgba(2,2,10,.8);border:1px dashed rgba(0,255,179,.4);
+padding:10px 12px;border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;
+font-size:11px;word-break:break-all;display:flex;justify-content:space-between;
+align-items:center;gap:8px;margin-bottom:8px;transition:.2s;cursor:pointer}
+.integration-link:hover{background:rgba(0,255,179,.08);border-color:rgba(0,255,179,.6);
+box-shadow:0 0 20px rgba(0,255,179,.2)}
+.integration-link span{flex:1}
+.integration-link .copy-btn{background:rgba(0,255,179,.15);color:#00ffb3;
+padding:4px 8px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid rgba(0,255,179,.3);cursor:pointer;flex-shrink:0}
+.integration-link .copy-btn:hover{background:rgba(0,255,179,.3)}
+.integration-tag{font-size:10px;color:#7a7a9a;margin-top:-4px;margin-bottom:10px;padding-left:2px}
 .brand{position:fixed;bottom:12px;right:16px;font-size:10px;color:#3a3a5a;letter-spacing:2px;
 font-family:'Space Mono',monospace}
 </style></head><body>
@@ -1058,6 +1138,22 @@ font-family:'Space Mono',monospace}
     <div class="timer" id="timer">{{ '%02d:00'|format(minutes) }}</div>
     <div class="status pending" id="status">⏳ Waiting for payment of ₹{{ "%.2f"|format(amount) }}...</div>
 
+    <div class="integration-box">
+        <div class="integration-title">🤖 Telegram Bot Integration</div>
+        <div class="integration-link" onclick="copyText('{{ telegram_url }}')">
+            <span>{{ telegram_url }}</span>
+            <button class="copy-btn">Copy</button>
+        </div>
+        <div class="integration-tag">Python / Node.js / PHP — all supported</div>
+
+        <div class="integration-title">🌐 Website / App Integration</div>
+        <div class="integration-link" onclick="copyText('{{ website_url }}')">
+            <span>{{ website_url }}</span>
+            <button class="copy-btn">Copy</button>
+        </div>
+        <div class="integration-tag">HTML / PHP / React / Vue / Angular — all supported</div>
+    </div>
+
     <div class="success-overlay" id="successOverlay">
         <div class="check-icon">✅</div>
         <div class="success-title">Payment Successful</div>
@@ -1066,6 +1162,8 @@ font-family:'Space Mono',monospace}
             <div><span>Amount</span><b id="dtAmount">-</b></div>
             <div><span>Transaction ID</span><b id="dtTxn">-</b></div>
             <div><span>UTR</span><b id="dtUtr">-</b></div>
+            <div><span>Sender</span><b id="dtSender">-</b></div>
+            <div><span>Sender UPI</span><b id="dtSenderUpi">-</b></div>
             <div><span>Date</span><b id="dtDate">-</b></div>
             <div><span>Status</span><b class="ok">Verified ✅</b></div>
         </div>
@@ -1073,14 +1171,18 @@ font-family:'Space Mono',monospace}
 
     <div class="partial-overlay" id="partialOverlay">
         <div class="warn-icon">⚠️</div>
-        <div class="warn-title">Payment Incomplete</div>
-        <div class="warn-msg" id="partialMsg">You paid less than required.</div>
+        <div class="warn-title" id="partialTitle">Payment Incomplete</div>
+        <div class="warn-msg" id="partialMsg">You paid less than required. Please pay the remaining amount to complete verification.</div>
         <div class="warn-details">
             <div><span>Expected</span><b>₹{{ "%.2f"|format(amount) }}</b></div>
             <div><span>Received</span><b id="partialRecv">₹0.00</b></div>
             <div><span>Remaining</span><b id="partialShort">₹0.00</b></div>
             <div><span>Txn ID</span><b id="partialTxn" style="color:#e8e8f5">-</b></div>
         </div>
+        <button onclick="closePartial()" style="background:rgba(255,165,2,.2);border:1px solid rgba(255,165,2,.4);
+        color:#ffa502;padding:10px 20px;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;">
+        Pay Remaining ₹<span id="partialBtnAmt">0.00</span>
+        </button>
     </div>
 </div>
 <div class="brand">FamPay AutoQR V{{ brand }}</div>
@@ -1098,7 +1200,11 @@ function tick(){
     const m=String(Math.floor(secs/60)).padStart(2,'0'), s=String(secs%60).padStart(2,'0');
     T.textContent=m+':'+s; if(secs<=60) T.style.color='#ff4757';
 }
-let partialShown = false;
+let partialShown = false, partialDismissed = false;
+function closePartial(){
+    document.getElementById('partialOverlay').classList.remove('show');
+    partialDismissed = true;
+}
 async function poll(){
     try{
         const r=await fetch('/api/check-payment/'+orderId), d=await r.json();
@@ -1107,17 +1213,31 @@ async function poll(){
             document.getElementById('dtAmount').textContent = '₹' + (d.txn.amount||expectedAmt);
             document.getElementById('dtTxn').textContent = d.txn.txn_id || '-';
             document.getElementById('dtUtr').textContent = d.txn.utr || '-';
+            document.getElementById('dtSender').textContent = d.txn.sender_name || '-';
+            document.getElementById('dtSenderUpi').textContent = d.txn.sender_upi || '-';
             document.getElementById('dtDate').textContent = d.txn.email_date || new Date().toLocaleString('en-IN', {hour:'2-digit', minute:'2-digit', hour12:true}) + ' IST';
             document.getElementById('successOverlay').classList.add('show');
             clearInterval(tInt); clearInterval(pInt);
         }
-        else if(d.status==='PARTIAL' && !partialShown){
-            partialShown = true;
+        else if(d.status==='PARTIAL' && !partialDismissed){
             document.getElementById('partialRecv').textContent = '₹' + (d.received||0).toFixed(2);
-            document.getElementById('partialShort').textContent = '₹' + (d.short_by||0).toFixed(2);
-            document.getElementById('partialMsg').textContent = d.message || 'Payment incomplete.';
+            const short = d.short_by||0;
+            const over = d.overpaid||0;
+            if(short > 0){
+                document.getElementById('partialShort').textContent = '₹' + short.toFixed(2);
+                document.getElementById('partialBtnAmt').textContent = short.toFixed(2);
+                document.getElementById('partialTitle').textContent = 'Payment Incomplete';
+                document.getElementById('partialMsg').textContent = d.message || 'Please pay remaining amount to complete verification.';
+            } else if(over > 0){
+                document.getElementById('partialShort').textContent = '₹0.00';
+                document.getElementById('partialBtnAmt').textContent = '0.00';
+                document.getElementById('partialTitle').textContent = 'Overpaid';
+                document.getElementById('partialMsg').textContent = d.message || 'You paid more than expected.';
+            }
             document.getElementById('partialTxn').textContent = d.txn_id || '-';
             document.getElementById('partialOverlay').classList.add('show');
+            partialShown = true;
+            // QR stays active — timer keeps running
         }
         else if(d.status==='EXPIRED'){
             S.textContent='❌ QR Expired'; S.className='status expired';
@@ -1125,17 +1245,613 @@ async function poll(){
         }
     }catch(e){}
 }
+function copyText(t){
+    navigator.clipboard.writeText(t).then(()=>{
+        const toast = document.createElement('div');
+        toast.textContent='✅ Copied!';
+        toast.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00e0a4;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999;box-shadow:0 0 30px rgba(0,224,164,.6)';
+        document.body.appendChild(toast);
+        setTimeout(()=>toast.remove(), 2000);
+    });
+}
 tInt=setInterval(tick,1000); pInt=setInterval(poll,1500); poll();
 </script></body></html>
 """
 
 # ==========================================
-# MAIN DASHBOARD — V4 GLOWING
+# INTEGRATION TELEGRAM PAGE (V5 NEW)
+# ==========================================
+INTEGRATION_TELEGRAM_HTML = r"""
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram Bot Integration</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif}
+body{background:#05050a;color:#e8e8f5;padding:20px;min-height:100vh}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:28px;font-weight:900;margin-bottom:8px;
+background:linear-gradient(90deg,#00ffb3,#a855f7,#ff00aa);background-size:200%;
+-webkit-background-clip:text;color:transparent;animation:rbow 4s linear infinite}
+@keyframes rbow{to{background-position:200% 0}}
+.sub{color:#7a7a9a;font-size:13px;margin-bottom:24px}
+.card{background:rgba(15,15,30,.85);border:1px solid #1f1f3a;border-radius:16px;padding:22px;margin-bottom:16px}
+.card h2{font-size:15px;font-weight:800;margin-bottom:14px;color:#00ffb3;
+text-shadow:0 0 20px rgba(0,255,179,.3);display:flex;align-items:center;gap:8px}
+.card h3{font-size:13px;font-weight:700;margin:16px 0 8px;color:#00d4ff}
+.api-box{background:#02020a;border:1px dashed rgba(0,255,179,.4);padding:14px;
+border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;font-size:12px;
+word-break:break-all;display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
+.copy{background:rgba(0,255,179,.15);color:#00ffb3;border:1px solid rgba(0,255,179,.3);
+padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0;transition:.2s}
+.copy:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
+pre{background:#02020a;border:1px solid rgba(0,255,179,.2);padding:16px;border-radius:10px;
+font-size:11px;overflow-x:auto;color:#00ffb3;line-height:1.6;font-family:'Space Mono',monospace;
+margin:12px 0}
+.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.tab{padding:8px 14px;background:rgba(21,21,42,.8);border:1px solid #1f1f3a;
+border-radius:8px;font-size:12px;font-weight:700;color:#7a7a9a;cursor:pointer;transition:.2s}
+.tab:hover{border-color:#00ffb3}
+.tab.active{background:linear-gradient(90deg,#00ffb3,#00d4ff);color:#05050a;border-color:#00ffb3}
+.hidden{display:none!important}
+.badge{display:inline-block;background:rgba(0,255,179,.15);color:#00ffb3;
+padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;text-transform:uppercase;margin-left:8px}
+</style></head><body>
+<div class="container">
+<h1>🤖 Telegram Bot Integration</h1>
+<p class="sub">Use your API key with any Telegram bot (Python/Node.js/PHP)</p>
+
+<div class="card">
+<h2>📌 Your Credentials</h2>
+<div class="api-box"><span>API_KEY: {{ api_key }}</span><button class="copy" onclick="copyText('{{ api_key }}')">Copy</button></div>
+<div class="api-box"><span>BASE_URL: {{ base }}</span><button class="copy" onclick="copyText('{{ base }}')">Copy</button></div>
+<div class="api-box"><span>QR URL: {{ qr_url }}</span><button class="copy" onclick="copyText('{{ qr_url }}')">Copy</button></div>
+<div class="api-box"><span>CHECK URL: {{ check_url }}</span><button class="copy" onclick="copyText('{{ check_url }}')">Copy</button></div>
+</div>
+
+<div class="card">
+<h2>🐍 Python Bot <span class="badge">Recommended</span></h2>
+<div class="tabs">
+<div class="tab active" onclick="switchTab('py1',this)">python-telegram-bot</div>
+<div class="tab" onclick="switchTab('py2',this)">pyTelegramBotAPI</div>
+</div>
+<pre id="py1">import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+API_KEY = "{{ api_key }}"
+BASE = "{{ base }}"
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome!\n\n"
+        "Commands:\n"
+        "/qr AMOUNT — Generate payment QR\n"
+        "/check ORDER_ID — Check payment status"
+    )
+
+async def qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /qr 100")
+    amount = ctx.args[0]
+    order_url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
+    await update.message.reply_text(
+        f"💳 *Pay ₹{amount}*\n\n"
+        f"Click to pay: [Open QR Page]({order_url})\n\n"
+        f"After payment, use /check to verify.",
+        parse_mode="Markdown",
+        disable_web_page_preview=False
+    )
+
+async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /check ORDER_ID")
+    order_id = ctx.args[0]
+    r = requests.get(f"{BASE}/api/v2/check/{API_KEY}?order_id={order_id}").json()
+
+    if r.get('status') == 'PAID':
+        await update.message.reply_text(
+            f"✅ *Payment Confirmed!*\n\n"
+            f"💰 Amount: ₹{r['amount']}\n"
+            f"🆔 Txn ID: `{r['txn_id']}`\n"
+            f"🔖 UTR: {r.get('utr', '-')}\n"
+            f"👤 From: {r.get('sender_name', '-')}\n"
+            f"📱 UPI: {r.get('sender_upi', '-')}",
+            parse_mode="Markdown"
+        )
+    elif r.get('status') == 'PARTIAL':
+        await update.message.reply_text(
+            f"⚠️ *Partial Payment*\n\n"
+            f"Expected: ₹{r['expected']}\n"
+            f"Received: ₹{r['received']}\n"
+            f"Short: ₹{r.get('short_by', 0)}\n\n"
+            f"{r.get('message', '')}",
+            parse_mode="Markdown"
+        )
+    elif r.get('status') == 'EXPIRED':
+        await update.message.reply_text("❌ QR expired. Generate a new one with /qr AMOUNT")
+    else:
+        await update.message.reply_text(f"⏳ Status: {r.get('status', 'PENDING')}")
+
+app = Application.builder().token("YOUR_BOT_TOKEN").build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("qr", qr))
+app.add_handler(CommandHandler("check", check))
+app.run_polling()</pre>
+<pre id="py2" class="hidden">import telebot
+import requests
+
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+API_KEY = "{{ api_key }}"
+BASE = "{{ base }}"
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+@bot.message_handler(commands=['start'])
+def start(msg):
+    bot.reply_to(msg,
+        "👋 Welcome!\n\n"
+        "/qr AMOUNT — Generate QR\n"
+        "/check ORDER_ID — Check status"
+    )
+
+@bot.message_handler(commands=['qr'])
+def qr(msg):
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return bot.reply_to(msg, "Usage: /qr 100")
+    amount = parts[1]
+    url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
+    bot.reply_to(msg, f"💳 Pay ₹{amount}:\n{url}")
+
+@bot.message_handler(commands=['check'])
+def check(msg):
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return bot.reply_to(msg, "Usage: /check ORDER_ID")
+    order_id = parts[1]
+    r = requests.get(f"{BASE}/api/v2/check/{API_KEY}?order_id={order_id}").json()
+    if r.get('status') == 'PAID':
+        bot.reply_to(msg, f"✅ Paid ₹{r['amount']}\nTxn: {r['txn_id']}\nUTR: {r.get('utr','-')}")
+    elif r.get('status') == 'PARTIAL':
+        bot.reply_to(msg, f"⚠️ Short by ₹{r.get('short_by',0)}\n{r.get('message','')}")
+    else:
+        bot.reply_to(msg, f"Status: {r.get('status')}")
+
+bot.infinity_polling()</pre>
+</div>
+
+<div class="card">
+<h2>📦 Node.js Bot</h2>
+<div class="tabs">
+<div class="tab active" onclick="switchTab('js1',this)">node-telegram-bot-api</div>
+<div class="tab" onclick="switchTab('js2',this)">Telegraf</div>
+</div>
+<pre id="js1">const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+
+const BOT_TOKEN = 'YOUR_BOT_TOKEN';
+const API_KEY = '{{ api_key }}';
+const BASE = '{{ base }}';
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id,
+    '👋 Welcome!\n\n/qr AMOUNT\n/check ORDER_ID'
+  );
+});
+
+bot.onText(/\/qr (.+)/, (msg, match) => {
+  const amount = match[1];
+  const url = `${BASE}/v2/fam/${API_KEY}?qr=${amount}`;
+  bot.sendMessage(msg.chat.id, `💳 Pay ₹${amount}:\n${url}`);
+});
+
+bot.onText(/\/check (.+)/, async (msg, match) => {
+  const orderId = match[1];
+  try {
+    const { data } = await axios.get(`${BASE}/api/v2/check/${API_KEY}?order_id=${orderId}`);
+    if (data.status === 'PAID') {
+      bot.sendMessage(msg.chat.id,
+        `✅ Payment Confirmed!\n\n` +
+        `💰 ₹${data.amount}\n` +
+        `🆔 ${data.txn_id}\n` +
+        `🔖 UTR: ${data.utr || '-'}\n` +
+        `👤 ${data.sender_name || '-'}`
+      );
+    } else if (data.status === 'PARTIAL') {
+      bot.sendMessage(msg.chat.id,
+        `⚠️ Partial Payment\n` +
+        `Expected: ₹${data.expected}\n` +
+        `Received: ₹${data.received}\n` +
+        `Short: ₹${data.short_by}\n\n${data.message}`
+      );
+    } else {
+      bot.sendMessage(msg.chat.id, `Status: ${data.status}`);
+    }
+  } catch(e) { bot.sendMessage(msg.chat.id, '❌ Error'); }
+});</pre>
+<pre id="js2" class="hidden">const { Telegraf } = require('telegraf');
+const axios = require('axios');
+
+const bot = new Telegraf('YOUR_BOT_TOKEN');
+const API_KEY = '{{ api_key }}';
+const BASE = '{{ base }}';
+
+bot.start((ctx) => ctx.reply('👋 Welcome!\n/qr AMOUNT\n/check ORDER_ID'));
+
+bot.command('qr', (ctx) => {
+  const amount = ctx.message.text.split(' ')[1];
+  if (!amount) return ctx.reply('Usage: /qr 100');
+  const url = `${BASE}/v2/fam/${API_KEY}?qr=${amount}`;
+  ctx.reply(`💳 Pay ₹${amount}:\n${url}`);
+});
+
+bot.command('check', async (ctx) => {
+  const orderId = ctx.message.text.split(' ')[1];
+  if (!orderId) return ctx.reply('Usage: /check ORDER_ID');
+  const { data } = await axios.get(`${BASE}/api/v2/check/${API_KEY}?order_id=${orderId}`);
+  if (data.status === 'PAID') {
+    ctx.reply(`✅ ₹${data.amount} | Txn: ${data.txn_id} | UTR: ${data.utr}`);
+  } else if (data.status === 'PARTIAL') {
+    ctx.reply(`⚠️ Short: ₹${data.short_by}\n${data.message}`);
+  } else {
+    ctx.reply(`Status: ${data.status}`);
+  }
+});
+
+bot.launch();</pre>
+</div>
+
+<div class="card">
+<h2>🐘 PHP Bot</h2>
+<pre>$bot_token = 'YOUR_BOT_TOKEN';
+$api_key = '{{ api_key }}';
+$base = '{{ base }}';
+
+$update = json_decode(file_get_contents('php://input'), true);
+$chat_id = $update['message']['chat']['id'];
+$text = $update['message']['text'] ?? '';
+
+if (strpos($text, '/qr ') === 0) {
+    $amount = explode(' ', $text)[1];
+    $url = "$base/v2/fam/$api_key?qr=$amount";
+    file_get_contents("https://api.telegram.org/bot$bot_token/sendMessage?" . http_build_query([
+        'chat_id' => $chat_id,
+        'text' => "💳 Pay ₹$amount:\n$url"
+    ]));
+}
+
+if (strpos($text, '/check ') === 0) {
+    $order_id = explode(' ', $text)[1];
+    $res = json_decode(file_get_contents("$base/api/v2/check/$api_key?order_id=$order_id"), true);
+    if ($res['status'] === 'PAID') {
+        $msg = "✅ Paid ₹{$res['amount']}\nTxn: {$res['txn_id']}";
+    } elseif ($res['status'] === 'PARTIAL') {
+        $msg = "⚠️ Short by ₹{$res['short_by']}";
+    } else {
+        $msg = "Status: {$res['status']}";
+    }
+    file_get_contents("https://api.telegram.org/bot$bot_token/sendMessage?" . http_build_query([
+        'chat_id' => $chat_id, 'text' => $msg
+    ]));
+}</pre>
+</div>
+
+<div class="card">
+<h2>📋 API Response Format</h2>
+<pre>{
+  "status": "PAID",
+  "order_id": "ORD17300000001234",
+  "amount": 100.0,
+  "expected": 100.0,
+  "txn_id": "FMPIB6930608000",
+  "utr": "667524755400",
+  "sender_name": "mal",
+  "sender_upi": "mal.628@superyes",
+  "email_date": "10:54 AM IST, 05 November 2026",
+  "verified": true
+}</pre>
+<pre>{
+  "status": "PARTIAL",
+  "expected": 100.0,
+  "received": 90.0,
+  "short_by": 10.0,
+  "message": "⚠️ You paid ₹90.00. Please pay remaining ₹10.00 to complete.",
+  "qr_still_active": true
+}</pre>
+</div>
+
+</div>
+<script>
+function copyText(t){navigator.clipboard.writeText(t).then(()=>{
+    const b=document.createElement('div');
+    b.textContent='✅ Copied!';
+    b.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00ffb3;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999';
+    document.body.appendChild(b);setTimeout(()=>b.remove(),2000);
+});}
+function switchTab(id,el){
+    el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    el.classList.add('active');
+    el.parentElement.parentElement.querySelectorAll('pre').forEach(p=>p.classList.add('hidden'));
+    document.getElementById(id).classList.remove('hidden');
+}
+</script></body></html>
+"""
+
+# ==========================================
+# INTEGRATION WEBSITE PAGE (V5 NEW)
+# ==========================================
+INTEGRATION_WEBSITE_HTML = r"""
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Website Integration</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif}
+body{background:#05050a;color:#e8e8f5;padding:20px;min-height:100vh}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:28px;font-weight:900;margin-bottom:8px;
+background:linear-gradient(90deg,#00ffb3,#a855f7,#ff00aa);background-size:200%;
+-webkit-background-clip:text;color:transparent;animation:rbow 4s linear infinite}
+@keyframes rbow{to{background-position:200% 0}}
+.sub{color:#7a7a9a;font-size:13px;margin-bottom:24px}
+.card{background:rgba(15,15,30,.85);border:1px solid #1f1f3a;border-radius:16px;padding:22px;margin-bottom:16px}
+.card h2{font-size:15px;font-weight:800;margin-bottom:14px;color:#00ffb3;
+text-shadow:0 0 20px rgba(0,255,179,.3)}
+.api-box{background:#02020a;border:1px dashed rgba(0,255,179,.4);padding:14px;
+border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;font-size:12px;
+word-break:break-all;display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
+.copy{background:rgba(0,255,179,.15);color:#00ffb3;border:1px solid rgba(0,255,179,.3);
+padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0;transition:.2s}
+.copy:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
+pre{background:#02020a;border:1px solid rgba(0,255,179,.2);padding:16px;border-radius:10px;
+font-size:11px;overflow-x:auto;color:#00ffb3;line-height:1.6;font-family:'Space Mono',monospace;
+margin:12px 0}
+.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.tab{padding:8px 14px;background:rgba(21,21,42,.8);border:1px solid #1f1f3a;
+border-radius:8px;font-size:12px;font-weight:700;color:#7a7a9a;cursor:pointer;transition:.2s}
+.tab:hover{border-color:#00ffb3}
+.tab.active{background:linear-gradient(90deg,#00ffb3,#00d4ff);color:#05050a;border-color:#00ffb3}
+.hidden{display:none!important}
+</style></head><body>
+<div class="container">
+<h1>🌐 Website / App Integration</h1>
+<p class="sub">Embed QR page on any website — HTML, PHP, React, Vue, Node.js all supported</p>
+
+<div class="card">
+<h2>📌 Your Credentials</h2>
+<div class="api-box"><span>API_KEY: {{ api_key }}</span><button class="copy" onclick="copyText('{{ api_key }}')">Copy</button></div>
+<div class="api-box"><span>BASE_URL: {{ base }}</span><button class="copy" onclick="copyText('{{ base }}')">Copy</button></div>
+<div class="api-box"><span>QR URL: {{ qr_url }}</span><button class="copy" onclick="copyText('{{ qr_url }}')">Copy</button></div>
+</div>
+
+<div class="card">
+<h2>📄 Method 1: Direct Link (Simplest)</h2>
+<pre>&lt;a href="{{ base }}/v2/fam/{{ api_key }}?qr=100" target="_blank"&gt;
+  💳 Pay ₹100
+&lt;/a&gt;</pre>
+</div>
+
+<div class="card">
+<h2>🖼️ Method 2: Iframe Embed</h2>
+<pre>&lt;iframe
+  src="{{ base }}/v2/fam/{{ api_key }}?qr=100"
+  width="460"
+  height="850"
+  frameborder="0"
+  style="border-radius:20px;box-shadow:0 0 40px rgba(0,255,179,.3)"
+&gt;&lt;/iframe&gt;</pre>
+</div>
+
+<div class="card">
+<h2>⚡ Method 3: JavaScript with Auto-Check</h2>
+<div class="tabs">
+<div class="tab active" onclick="switchTab('js1',this)">Vanilla JS</div>
+<div class="tab" onclick="switchTab('js2',this)">React</div>
+<div class="tab" onclick="switchTab('js3',this)">Vue</div>
+</div>
+<pre id="js1">&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;&lt;title&gt;Pay ₹100&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;
+  &lt;h2&gt;Pay ₹100&lt;/h2&gt;
+  &lt;iframe src="{{ base }}/v2/fam/{{ api_key }}?qr=100"
+          width="460" height="850" frameborder="0"
+          style="border-radius:20px"&gt;&lt;/iframe&gt;
+
+  &lt;script&gt;
+  // Get order_id from URL after iframe loads, or use latest
+  const API_KEY = '{{ api_key }}';
+  const BASE = '{{ base }}';
+
+  async function checkPayment() {
+    const r = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
+    const data = await r.json();
+    if (data.status === 'PAID') {
+      alert(`✅ Payment received: ₹${data.amount}\nTxn: ${data.txn_id}`);
+      // Redirect, show message, etc.
+    } else if (data.status === 'PARTIAL') {
+      console.log(`⚠️ Short by ₹${data.short_by}`);
+    }
+    return data;
+  }
+
+  setInterval(checkPayment, 2000);
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;</pre>
+
+<pre id="js2" class="hidden">import { useEffect, useState } from 'react';
+
+function PaymentPage() {
+  const [status, setStatus] = useState('PENDING');
+  const [orderData, setOrderData] = useState(null);
+
+  const API_KEY = '{{ api_key }}';
+  const BASE = '{{ base }}';
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const res = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
+      const data = await res.json();
+      if (data.status === 'PAID') {
+        setStatus('PAID');
+        setOrderData(data);
+        clearInterval(interval);
+      } else if (data.status === 'PARTIAL') {
+        setStatus('PARTIAL');
+        setOrderData(data);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    &lt;div&gt;
+      &lt;h2&gt;Pay ₹100&lt;/h2&gt;
+      {status === 'PAID' && (
+        &lt;div&gt;✅ Paid ₹{orderData.amount} — Txn {orderData.txn_id}&lt;/div&gt;
+      )}
+      {status === 'PARTIAL' && (
+        &lt;div&gt;⚠️ Short by ₹{orderData.short_by}&lt;/div&gt;
+      )}
+      &lt;iframe
+        src={`${BASE}/v2/fam/${API_KEY}?qr=100`}
+        width="460" height="850" frameBorder="0"
+      /&gt;
+    &lt;/div&gt;
+  );
+}</pre>
+
+<pre id="js3" class="hidden">&lt;template&gt;
+  &lt;div&gt;
+    &lt;h2&gt;Pay ₹100&lt;/h2&gt;
+    &lt;div v-if="status === 'PAID'"&gt;✅ Paid ₹{{ orderData.amount }}&lt;/div&gt;
+    &lt;div v-if="status === 'PARTIAL'"&gt;⚠️ Short by ₹{{ orderData.short_by }}&lt;/div&gt;
+    &lt;iframe :src="qrUrl" width="460" height="850" /&gt;
+  &lt;/div&gt;
+&lt;/template&gt;
+
+&lt;script setup&gt;
+import { ref, onMounted, onUnmounted } from 'vue';
+
+const API_KEY = '{{ api_key }}';
+const BASE = '{{ base }}';
+const qrUrl = `${BASE}/v2/fam/${API_KEY}?qr=100`;
+const status = ref('PENDING');
+const orderData = ref(null);
+let interval;
+
+onMounted(() => {
+  interval = setInterval(async () => {
+    const res = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
+    const data = await res.json();
+    if (data.status === 'PAID') {
+      status.value = 'PAID';
+      orderData.value = data;
+      clearInterval(interval);
+    } else if (data.status === 'PARTIAL') {
+      status.value = 'PARTIAL';
+      orderData.value = data;
+    }
+  }, 2000);
+});
+
+onUnmounted(() => clearInterval(interval));
+&lt;/script&gt;</pre>
+</div>
+
+<div class="card">
+<h2>🐘 PHP Integration</h2>
+<pre>&lt;?php
+$api_key = '{{ api_key }}';
+$base = '{{ base }}';
+$amount = 100;
+
+// Generate QR page URL
+$qr_url = "$base/v2/fam/$api_key?qr=$amount";
+?&gt;
+
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;body&gt;
+  &lt;h2&gt;Pay ₹&lt;?= $amount ?&gt;&lt;/h2&gt;
+  &lt;iframe src="&lt;?= $qr_url ?&gt;" width="460" height="850"&gt;&lt;/iframe&gt;
+&lt;/body&gt;
+&lt;/html&gt;</pre>
+</div>
+
+<div class="card">
+<h2>🟢 Node.js / Express</h2>
+<pre>const express = require('express');
+const axios = require('axios');
+const app = express();
+
+const API_KEY = '{{ api_key }}';
+const BASE = '{{ base }}';
+
+app.get('/pay', async (req, res) => {
+  const amount = req.query.amount || 100;
+  res.send(`
+    &lt;h2&gt;Pay ₹${amount}&lt;/h2&gt;
+    &lt;iframe src="${BASE}/v2/fam/${API_KEY}?qr=${amount}"
+            width="460" height="850"&gt;&lt;/iframe&gt;
+    &lt;script&gt;
+    setInterval(async () => {
+      const r = await fetch('/check');
+      const d = await r.json();
+      if (d.status === 'PAID') alert('Paid: ₹' + d.amount);
+    }, 2000);
+    &lt;/script&gt;
+  `);
+});
+
+app.get('/check', async (req, res) => {
+  const r = await axios.get(`${BASE}/api/v2/check/${API_KEY}`);
+  res.json(r.data);
+});
+
+app.listen(3000);</pre>
+</div>
+
+<div class="card">
+<h2>📋 API Response Format</h2>
+<pre>{
+  "status": "PAID",
+  "amount": 100.0,
+  "txn_id": "FMPIB6930608000",
+  "utr": "667524755400",
+  "sender_name": "mal",
+  "sender_upi": "mal.628@superyes",
+  "email_date": "10:54 AM IST, 05 November 2026",
+  "verified": true
+}</pre>
+</div>
+
+</div>
+<script>
+function copyText(t){navigator.clipboard.writeText(t).then(()=>{
+    const b=document.createElement('div');
+    b.textContent='✅ Copied!';
+    b.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00ffb3;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999';
+    document.body.appendChild(b);setTimeout(()=>b.remove(),2000);
+});}
+function switchTab(id,el){
+    el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    el.classList.add('active');
+    el.parentElement.parentElement.querySelectorAll('pre').forEach(p=>p.classList.add('hidden'));
+    document.getElementById(id).classList.remove('hidden');
+}
+</script></body></html>
+"""
+
+# ==========================================
+# MAIN DASHBOARD V5
 # ==========================================
 MAIN_HTML = r"""
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FamPay AutoQR V4.0 ULTRA</title>
+<title>FamPay AutoQR V5.0 ULTRA PRO</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
@@ -1300,12 +2016,17 @@ box-shadow:0 0 15px rgba(0,255,179,.1)}
 .uptime b{color:var(--ng);text-shadow:0 0 8px var(--ng)}
 .period-tab{display:flex;gap:6px;margin-bottom:14px}
 .period-tab .tab{flex:1;text-align:center}
+.integration-pill{display:inline-flex;align-items:center;gap:6px;
+padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700;
+background:rgba(0,255,179,.15);color:var(--ng);border:1px solid rgba(0,255,179,.3);
+cursor:pointer;transition:.2s}
+.integration-pill:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
 </style></head><body>
 
 <div id="authScreen" class="auth-wrap">
   <div class="auth-card">
-    <div class="logo">◆ FamPay AutoQR V4.0</div>
-    <div class="logo-sub">Ultra Luxury Edition · 150+ Features · Flash Speed</div>
+    <div class="logo">◆ FamPay AutoQR V5.0</div>
+    <div class="logo-sub">ULTRA PRO · Telegram + Website · Partial Payment Fix</div>
     <div id="loginForm">
       <div class="field"><label>Username</label><input id="lgU" placeholder="admin" autocomplete="username"></div>
       <div class="field"><label>Password</label><input id="lgP" type="password" placeholder="••••••" autocomplete="current-password"></div>
@@ -1324,7 +2045,7 @@ box-shadow:0 0 15px rgba(0,255,179,.1)}
 
 <div id="shell" class="shell hidden">
   <aside id="sidebar" class="sidebar">
-    <div class="brand">◆ FamPay AutoQR V4</div>
+    <div class="brand">◆ FamPay AutoQR V5</div>
     <nav class="nav">
       <div class="item active" data-p="dashboard" onclick="go('dashboard')">📊 Dashboard</div>
       <div class="item" data-p="analytics" onclick="go('analytics')">📈 Analytics</div>
@@ -1442,7 +2163,7 @@ box-shadow:0 0 15px rgba(0,255,179,.1)}
     <section id="p-partials" class="page hidden">
       <div class="card">
         <h2>⚠️ Partial / Over Payments</h2>
-        <p style="font-size:12px;color:var(--dim);margin-bottom:14px">Transactions that did NOT match expected amount.</p>
+        <p style="font-size:12px;color:var(--dim);margin-bottom:14px">Transactions that did NOT match expected amount. QR stays active — user can pay remaining.</p>
         <div id="partialList"></div>
       </div>
     </section>
@@ -1453,20 +2174,43 @@ box-shadow:0 0 15px rgba(0,255,179,.1)}
 
     <section id="p-docs" class="page hidden">
       <div class="card">
-        <h2>📖 API Documentation</h2>
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">1. Generate QR (HTML)</h3>
-        <div class="api-out"><span>GET /v2/fam/YOUR_API_KEY?qr=100</span><button class="copy" onclick="copyText('/v2/fam/YOUR_KEY?qr=100')">Copy</button></div>
-        <p style="font-size:12px;color:var(--dim);margin-top:6px">Optional: &minutes=20</p>
+        <h2>📖 API Documentation V5</h2>
+        <div style="background:rgba(0,255,179,.08);border:1px solid rgba(0,255,179,.3);padding:14px;border-radius:10px;margin-bottom:14px">
+          <div style="color:var(--ng);font-weight:800;margin-bottom:6px">✨ New in V5.0</div>
+          <ul style="font-size:12px;color:var(--dim);padding-left:18px;line-height:1.8">
+            <li>Telegram Bot integration link (auto-generated)</li>
+            <li>Website/App integration link (auto-generated)</li>
+            <li>Partial payment handling — QR stays active</li>
+            <li>Sender name + UPI + email date in response</li>
+            <li>Multi-QR concurrent support</li>
+          </ul>
+        </div>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">2. Check Payment Status</h3>
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">🔗 Get Your Integration Links</h3>
+        <p style="font-size:12px;color:var(--dim);margin-bottom:8px">Generate an API key → you'll get 2 integration links:</p>
+        <div class="api-out"><span>Telegram: /api/integration/telegram/YOUR_KEY</span></div>
+        <div class="api-out"><span>Website:  /api/integration/website/YOUR_KEY</span></div>
+        <p style="font-size:12px;color:var(--dim);margin-top:8px">Open these links in a browser — you'll get full copy-paste code for Python, Node.js, PHP, HTML, React, Vue.</p>
+
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">1. Generate QR</h3>
+        <div class="api-out"><span>GET /v2/fam/YOUR_API_KEY?qr=100</span><button class="copy" onclick="copyText('/v2/fam/YOUR_KEY?qr=100')">Copy</button></div>
+
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">2. Check Payment</h3>
         <div class="api-out"><span>GET /api/v2/check/YOUR_API_KEY?order_id=ORD...</span><button class="copy" onclick="copyText('/api/v2/check/YOUR_KEY')">Copy</button></div>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">3. Response Format</h3>
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">3. Payment Statuses</h3>
+        <ul class="flist">
+          <li><b>PENDING</b> — waiting for payment</li>
+          <li><b>PAID</b> — verified ✅ (amount matches)</li>
+          <li><b>PARTIAL</b> — paid less/more, QR still active</li>
+          <li><b>EXPIRED</b> — time over</li>
+        </ul>
+
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">4. PAID Response</h3>
 <pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">{
   "status": "PAID",
   "order_id": "ORD17300000001234",
-  "amount": 20.0,
-  "expected": 20.0,
+  "amount": 100.0,
   "txn_id": "FMPIB6930608000",
   "utr": "667524755400",
   "sender_name": "mal",
@@ -1475,96 +2219,32 @@ box-shadow:0 0 15px rgba(0,255,179,.1)}
   "verified": true
 }</pre>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">4. Telegram Bot (Python)</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">import requests, time
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-API_KEY = "YOUR_API_KEY"
-BASE = "https://yourdomain.com"
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use /qr AMOUNT to pay")
-
-async def qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    amount = ctx.args[0] if ctx.args else "100"
-    url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
-    await update.message.reply_text(f"💳 Pay ₹{amount}: {url}")
-
-async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    order_id = ctx.args[0] if ctx.args else ""
-    r = requests.get(f"{BASE}/api/v2/check/{API_KEY}?order_id={order_id}").json()
-    if r.get('status') == 'PAID':
-        await update.message.reply_text(
-            f"✅ Payment Received!\n"
-            f"₹{r['amount']}\n"
-            f"Txn: {r['txn_id']}\nUTR: {r.get('utr','')}"
-        )
-    else:
-        await update.message.reply_text(f"Status: {r.get('status')}")
-
-app = Application.builder().token("YOUR_BOT_TOKEN").build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("qr", qr))
-app.add_handler(CommandHandler("check", check))
-app.run_polling()</pre>
-
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">5. Telegram Bot (Node.js)</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-
-const BOT_TOKEN = 'YOUR_BOT_TOKEN';
-const API_KEY = 'YOUR_API_KEY';
-const BASE = 'https://yourdomain.com';
-
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-bot.onText(/\/qr (.+)/, async (msg, match) => {
-  const amount = match[1];
-  const url = `${BASE}/v2/fam/${API_KEY}?qr=${amount}`;
-  bot.sendMessage(msg.chat.id, `💳 Pay ₹${amount}:\n${url}`);
-});
-
-bot.onText(/\/check (.+)/, async (msg, match) => {
-  const orderId = match[1];
-  const { data } = await axios.get(`${BASE}/api/v2/check/${API_KEY}?order_id=${orderId}`);
-  if (data.status === 'PAID') {
-    bot.sendMessage(msg.chat.id,
-      `✅ Payment Received!\n₹${data.amount}\nTxn: ${data.txn_id}\nUTR: ${data.utr}`);
-  } else {
-    bot.sendMessage(msg.chat.id, `Status: ${data.status}`);
-  }
-});
-
-console.log('Bot running...');</pre>
-
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">6. Website (HTML + JS)</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">&lt;!DOCTYPE html&gt;
-&lt;html&gt;&lt;body&gt;
-&lt;h2&gt;Pay ₹100&lt;/h2&gt;
-&lt;iframe src="https://yourdomain.com/v2/fam/YOUR_KEY?qr=100"
-        width="440" height="680" frameborder="0"&gt;&lt;/iframe&gt;
-&lt;script&gt;
-setInterval(async () => {
-  const r = await fetch('/api/v2/check/YOUR_KEY');
-  const d = await r.json();
-  if (d.status === 'PAID') {
-    alert('Payment received: ₹' + d.amount);
-  }
-}, 1500);
-&lt;/script&gt;
-&lt;/body&gt;&lt;/html&gt;</pre>
-
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">7. PHP / cURL</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">$ch = curl_init("https://yourdomain.com/api/v2/check/YOUR_KEY");
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-$res = json_decode(curl_exec($ch), true);
-if ($res['status'] === 'PAID') {
-    echo "Paid ₹" . $res['amount'];
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">5. PARTIAL Response</h3>
+<pre style="background:#02020a;color:#ffa502;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">{
+  "status": "PARTIAL",
+  "expected": 100.0,
+  "received": 90.0,
+  "short_by": 10.0,
+  "message": "⚠️ You paid ₹90.00. Please pay remaining ₹10.00 to complete.",
+  "qr_still_active": true
 }</pre>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">8. Header Auth</h3>
-        <p style="font-size:12px;color:var(--dim)">Send <code>X-API-Key: YOUR_KEY</code></p>
+        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">6. Quick Example (Python)</h3>
+<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">import requests
+
+API_KEY = "YOUR_KEY"
+BASE = "https://yourdomain.com"
+
+# Generate QR link
+qr_url = f"{BASE}/v2/fam/{API_KEY}?qr=100"
+print(f"Send this to user: {qr_url}")
+
+# Check status
+r = requests.get(f"{BASE}/api/v2/check/{API_KEY}").json()
+if r['status'] == 'PAID':
+    print(f"✅ Received ₹{r['amount']} from {r['sender_name']} ({r['sender_upi']})")
+elif r['status'] == 'PARTIAL':
+    print(f"⚠️ Short by ₹{r['short_by']} — QR still active")</pre>
       </div>
     </section>
 
@@ -1580,20 +2260,20 @@ if ($res['status'] === 'PAID') {
         <button class="btn" onclick="saveSettings()">💾 Save Settings</button>
       </div>
       <div class="card">
-        <h2>ℹ️ About</h2>
+        <h2>ℹ️ About V5.0</h2>
         <ul class="flist">
-          <li>Version: V4.0.0 ULTRA PRO</li>
-          <li>Engine: Python Flask + SQLite + Chart.js</li>
-          <li>Flash speed verification: ~1-2 sec</li>
-          <li>Multi-QR concurrent: ENABLED</li>
-          <li>Email window: 2 min only (narrow)</li>
-          <li>Personal line filter: ENABLED</li>
-          <li>Sender name/UPI extraction: ENABLED</li>
-          <li>Duplicate txn block: ENABLED</li>
-          <li>Webhook support: ENABLED</li>
-          <li>CORS: All origins allowed</li>
-          <li>Glow UI + Aurora background: ENABLED</li>
-          <li>Chart.js analytics: 150+ features</li>
+          <li>Version: V5.0.0 ULTRA PRO</li>
+          <li>Telegram Bot Integration: ✅ PY/JS/PHP</li>
+          <li>Website Integration: ✅ HTML/React/Vue/Node</li>
+          <li>Partial Payment Fix: ✅ QR stays active</li>
+          <li>Sender Name + UPI Extraction: ✅</li>
+          <li>UTR + Email Date Display: ✅</li>
+          <li>Multi-QR Concurrent: ✅</li>
+          <li>Flash Speed Verification: ~1-2 sec</li>
+          <li>Email Window: 2 min narrow</li>
+          <li>Duplicate Txn Block: ✅</li>
+          <li>Webhook Support: ✅</li>
+          <li>Glow UI + Aurora Background: ✅</li>
         </ul>
       </div>
     </section>
@@ -1845,8 +2525,10 @@ async function genKey(){
     const rate_limit=parseInt(document.getElementById('keyRate').value)||60;
     const d=await api('/api/generate-key',{method:'POST',body:JSON.stringify({mode,days,rate_limit,label:document.getElementById('keyLabel').value})});
     document.getElementById('keyRes').innerHTML=`<div style="background:rgba(0,255,179,.08);border:1px solid rgba(0,255,179,.4);padding:14px;border-radius:10px">
-      <div style="color:var(--ng);font-weight:700;margin-bottom:6px">✅ Key Generated</div>
-      <div class="api-out"><span>${esc(d.example)}</span><button class="copy" onclick="copyText('${esc(d.example)}')">Copy</button></div>
+      <div style="color:var(--ng);font-weight:700;margin-bottom:10px">✅ Key Generated</div>
+      <div class="api-out"><span>QR: ${esc(d.example)}</span><button class="copy" onclick="copyText('${esc(d.example)}')">Copy</button></div>
+      <div class="api-out" style="margin-top:8px"><span>Telegram: ${esc(d.telegram_url)}</span><button class="copy" onclick="window.open('${esc(d.telegram_url)}','_blank')">Open</button></div>
+      <div class="api-out" style="margin-top:8px"><span>Website: ${esc(d.website_url)}</span><button class="copy" onclick="window.open('${esc(d.website_url)}','_blank')">Open</button></div>
     </div>`;
     loadKeys();
   }catch(e){toast('❌ '+e.message,true)}
@@ -1861,7 +2543,11 @@ async function loadKeys(){
         <button class="copy" style="background:rgba(255,71,87,.15);color:var(--dang)" onclick="delKey('${esc(k.api_key)}')">Delete</button>
       </div>
       <div class="meta">Requests: ${k.total_requests} · QRs: ${k.total_qr} · Received: ₹${k.total_received} · Rate: ${k.rate_limit}/min</div>
-      <div class="api-out"><span>${esc(k.url)}</span><button class="copy" onclick="copyText('${esc(k.url)}')">Copy URL</button></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+        <span class="integration-pill" onclick="window.open('${esc(k.telegram_url)}','_blank')">🤖 Telegram Integration</span>
+        <span class="integration-pill" onclick="window.open('${esc(k.website_url)}','_blank')">🌐 Website Integration</span>
+        <span class="integration-pill" onclick="copyText('${esc(k.url)}?qr=AMOUNT')">📋 Copy QR URL</span>
+      </div>
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}
 }
@@ -1878,7 +2564,7 @@ async function loadHistory(){
       <div style="flex:1"><div class="amt">+ ₹${t.amount.toFixed(2)}</div>
       <div class="meta">Txn: ${esc(t.txn_id)||'-'}</div>
       <div class="meta">UTR: ${esc(t.utr)||'-'}</div>
-      <div class="meta">From: ${esc(t.sender_upi)||'-'}</div>
+      <div class="meta">From: ${esc(t.sender_name)||'-'} (${esc(t.sender_upi)||'-'})</div>
       <div class="meta">${esc(t.email_date)||esc(t.paid_at)}</div></div>
       <div style="font-size:10px;color:var(--dim);text-align:right;font-family:'Space Mono',monospace">${esc(t.order_id)||''}</div>
     </div>`).join('');
@@ -1891,7 +2577,8 @@ async function loadPartials(){
     if(!ps.length){el.innerHTML='<div class="empty"><div class="empty-ic">✨</div>No partial payments — all clean!</div>';return}
     el.innerHTML=ps.map(p=>`<div class="txn partial">
       <div><div class="amt">₹${p.received.toFixed(2)} / ₹${p.expected.toFixed(2)}</div>
-      <div class="meta">Short by ₹${(p.short_by||0).toFixed(2)} · Txn ${esc(p.txn_id)||'-'}</div></div>
+      <div class="meta">Short by ₹${(p.short_by||0).toFixed(2)} · Txn ${esc(p.txn_id)||'-'}</div>
+      <div class="meta">UTR ${esc(p.utr)||'-'}</div></div>
       <div style="font-size:11px;color:var(--dim);text-align:right">${esc(p.created_at)}<br>${esc(p.order_id)}</div>
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}

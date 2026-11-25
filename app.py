@@ -4,7 +4,7 @@ from io import BytesIO
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, session, g, redirect
+from flask import Flask, request, jsonify, render_template_string, session, g, redirect, make_response
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import qrcode
@@ -60,6 +60,8 @@ def init_db():
             webhook_url TEXT DEFAULT '',
             auto_verify INTEGER DEFAULT 1,
             theme TEXT DEFAULT 'dark',
+            telegram_bot_link TEXT DEFAULT '',
+            website_link TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS api_keys (
@@ -72,12 +74,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS qr_sessions (
-            order_id TEXT PRIMARY KEY, api_key TEXT NOT NULL,
+            order_id TEXT PRIMARY KEY, 
+            session_id TEXT UNIQUE,
+            api_key TEXT NOT NULL,
             username TEXT NOT NULL, amount REAL NOT NULL,
             status TEXT DEFAULT 'PENDING',
             txn_id TEXT DEFAULT '', utr TEXT DEFAULT '',
             paid_amount REAL DEFAULT 0,
             partial_amount REAL DEFAULT 0,
+            total_paid REAL DEFAULT 0,
             short_by REAL DEFAULT 0,
             overpaid REAL DEFAULT 0,
             notes TEXT DEFAULT '',
@@ -86,7 +91,8 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
-            order_id TEXT, amount REAL NOT NULL,
+            order_id TEXT, session_id TEXT,
+            amount REAL NOT NULL,
             txn_id TEXT UNIQUE, utr TEXT,
             sender_name TEXT DEFAULT '',
             sender_upi TEXT DEFAULT '',
@@ -101,7 +107,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS partial_payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT, username TEXT,
+            order_id TEXT, session_id TEXT, username TEXT,
             expected REAL, received REAL, short_by REAL,
             txn_id TEXT, utr TEXT,
             notified INTEGER DEFAULT 0,
@@ -109,10 +115,32 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_qr_apikey ON qr_sessions(api_key);
         CREATE INDEX IF NOT EXISTS idx_qr_status ON qr_sessions(status);
+        CREATE INDEX IF NOT EXISTS idx_qr_session ON qr_sessions(session_id);
         CREATE INDEX IF NOT EXISTS idx_txn_username ON transactions(username);
         CREATE INDEX IF NOT EXISTS idx_txn_paidat ON transactions(paid_at);
         CREATE INDEX IF NOT EXISTS idx_partial_txn ON partial_payments(txn_id);
         """)
+        
+        # Migrate existing DB - add new columns if missing
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN telegram_bot_link TEXT DEFAULT ''")
+        except: pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN website_link TEXT DEFAULT ''")
+        except: pass
+        try:
+            db.execute("ALTER TABLE qr_sessions ADD COLUMN session_id TEXT")
+        except: pass
+        try:
+            db.execute("ALTER TABLE qr_sessions ADD COLUMN total_paid REAL DEFAULT 0")
+        except: pass
+        try:
+            db.execute("ALTER TABLE transactions ADD COLUMN session_id TEXT")
+        except: pass
+        try:
+            db.execute("ALTER TABLE partial_payments ADD COLUMN session_id TEXT")
+        except: pass
+        
         if not db.execute("SELECT id FROM users WHERE username='admin'").fetchone():
             db.execute("INSERT INTO users (username,password_hash,full_name,upi_id) VALUES (?,?,?,?)",
                        ("admin", generate_password_hash("admin123"), "Riju Mondal", "riju@fam"))
@@ -132,6 +160,13 @@ def login_required(f):
 
 def gen_key(): return ''.join(random.choices(string.ascii_uppercase+string.digits, k=20))
 def gen_order_id(): return "ORD" + str(int(time.time())) + ''.join(random.choices(string.digits, k=6))
+
+def gen_session_id():
+    """Generate random session ID like: Jwowbsiajjaj1919199"""
+    chars = string.ascii_letters + string.digits
+    prefix = ''.join(random.choices(string.ascii_letters, k=14))
+    suffix = ''.join(random.choices(string.digits, k=7))
+    return prefix + suffix
 
 def qr_b64(data):
     q = qrcode.QRCode(version=1, box_size=10, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
@@ -189,7 +224,7 @@ def notify_webhook(username, event, payload):
     except: pass
 
 # ==========================================
-# ⚡ FLASH SPEED EMAIL CHECK (V5)
+# EMAIL PARSING
 # ==========================================
 def strip_personal_lines(body):
     lines = body.split('\n')
@@ -280,7 +315,6 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
                 utr = utr_m.group(1) if utr_m else ""
 
                 sender_name, sender_upi = extract_sender(raw_body)
-
                 email_date = extract_email_date(raw_body)
                 if not email_date:
                     email_date = dt.strftime("%d %b %Y, %I:%M %p IST")
@@ -299,8 +333,7 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
                     return True, {
                         "txn_id": txn_id, "utr": utr, "amount": recv,
                         "expected": expected_amount, "kind": "EXACT",
-                        "sender_name": sender_name,
-                        "sender_upi": sender_upi,
+                        "sender_name": sender_name, "sender_upi": sender_upi,
                         "email_date": email_date
                     }, "PAID"
 
@@ -312,8 +345,7 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
                         "txn_id": txn_id, "utr": utr, "amount": recv,
                         "expected": expected_amount, "short_by": short_by,
                         "kind": "SHORT",
-                        "sender_name": sender_name,
-                        "sender_upi": sender_upi,
+                        "sender_name": sender_name, "sender_upi": sender_upi,
                         "email_date": email_date
                     }, "PARTIAL"
 
@@ -325,8 +357,7 @@ def read_fampay_email(username, expected_amount, order_id=None, tolerance=0.0, w
                         "txn_id": txn_id, "utr": utr, "amount": recv,
                         "expected": expected_amount, "overpaid": over,
                         "kind": "OVER",
-                        "sender_name": sender_name,
-                        "sender_upi": sender_upi,
+                        "sender_name": sender_name, "sender_upi": sender_upi,
                         "email_date": email_date
                     }, "PARTIAL"
 
@@ -387,6 +418,8 @@ def me():
         "email_status": u['email_status'], "email_last_check": u['email_last_check'],
         "tolerance": u['tolerance'] or 0, "webhook_url": u['webhook_url'] or '',
         "auto_verify": u['auto_verify'], "theme": u['theme'] or 'dark',
+        "telegram_bot_link": u['telegram_bot_link'] or '',
+        "website_link": u['website_link'] or '',
         "version": APP_VERSION, "boot_time": BOOT_TIME
     })
 
@@ -396,7 +429,8 @@ def setup_account():
     d = parse_request_data()
     db = get_db()
     db.execute("""UPDATE users SET full_name=?, upi_id=?, mobile=?, email=?, app_password=?,
-                  default_qr_minutes=?, tolerance=?, webhook_url=?, auto_verify=?, theme=?
+                  default_qr_minutes=?, tolerance=?, webhook_url=?, auto_verify=?, theme=?,
+                  telegram_bot_link=?, website_link=?
                   WHERE username=?""",
                (d.get('full_name','').strip(), d.get('upi_id','').strip(), d.get('mobile','').strip(),
                 d.get('email','').strip(), d.get('app_password','').strip(),
@@ -405,6 +439,8 @@ def setup_account():
                 d.get('webhook_url','').strip(),
                 int(d.get('auto_verify', 1)),
                 d.get('theme', 'dark'),
+                d.get('telegram_bot_link','').strip(),
+                d.get('website_link','').strip(),
                 session['user']))
     db.commit()
     audit(session['user'], "SETUP_ACCOUNT", "Account details updated")
@@ -545,13 +581,15 @@ def dashboard():
         "total_received_via_api": round(sum(k['total_received'] for k in keys),2),
         "transactions": [{
             "amount": t['amount'], "txn_id": t['txn_id'], "utr": t['utr'],
-            "order_id": t['order_id'], "paid_at": t['paid_at'],
+            "order_id": t['order_id'], "session_id": t['session_id'] or '',
+            "paid_at": t['paid_at'],
             "sender_name": t['sender_name'] or '',
             "sender_upi": t['sender_upi'] or '',
             "email_date": t['email_date'] or ''
         } for t in txns],
         "partial_payments": [{
-            "order_id": p['order_id'], "expected": p['expected'],
+            "order_id": p['order_id'], "session_id": p['session_id'] or '',
+            "expected": p['expected'],
             "received": p['received'], "short_by": p['short_by'],
             "txn_id": p['txn_id'], "created_at": p['created_at']
         } for p in partials]
@@ -578,9 +616,7 @@ def gen_key_api():
     return jsonify({"status":"success", "api_key": key, "expiry": expiry,
         "api_url": build_url(f"/v2/fam/{key}"),
         "example": build_url(f"/v2/fam/{key}?qr=100"),
-        "check_url": build_url(f"/api/v2/check/{key}"),
-        "telegram_url": build_url(f"/api/integration/telegram/{key}"),
-        "website_url": build_url(f"/api/integration/website/{key}")})
+        "check_url": build_url(f"/api/v2/check/{key}")})
 
 @app.route('/api/list-keys', methods=['GET'])
 @login_required
@@ -593,9 +629,7 @@ def list_keys():
         "total_received": round(r['total_received'],2),
         "rate_limit": r['rate_limit'],
         "url": build_url(f"/v2/fam/{r['api_key']}"),
-        "check_url": build_url(f"/api/v2/check/{r['api_key']}"),
-        "telegram_url": build_url(f"/api/integration/telegram/{r['api_key']}"),
-        "website_url": build_url(f"/api/integration/website/{r['api_key']}")
+        "check_url": build_url(f"/api/v2/check/{r['api_key']}")
     } for r in rows])
 
 @app.route('/api/delete-key/<api_key>', methods=['DELETE'])
@@ -616,7 +650,8 @@ def list_txns():
                       (session['user'], limit)).fetchall()
     return jsonify([{
         "amount": t['amount'], "txn_id": t['txn_id'], "utr": t['utr'],
-        "order_id": t['order_id'], "paid_at": t['paid_at'],
+        "order_id": t['order_id'], "session_id": t['session_id'] or '',
+        "paid_at": t['paid_at'],
         "sender_name": t['sender_name'] or '',
         "sender_upi": t['sender_upi'] or '',
         "email_date": t['email_date'] or ''
@@ -629,7 +664,8 @@ def list_partials():
     rows = db.execute("SELECT * FROM partial_payments WHERE username=? ORDER BY id DESC LIMIT 100",
                       (session['user'],)).fetchall()
     return jsonify([{
-        "order_id": p['order_id'], "expected": p['expected'],
+        "order_id": p['order_id'], "session_id": p['session_id'] or '',
+        "expected": p['expected'],
         "received": p['received'], "short_by": p['short_by'],
         "txn_id": p['txn_id'], "utr": p['utr'],
         "created_at": p['created_at']
@@ -647,7 +683,7 @@ def audit_log():
     } for r in rows])
 
 # ==========================================
-# PAYMENT VERIFICATION (V5 — Partial-safe)
+# PAYMENT VERIFICATION - MULTI-PAYMENT SUPPORT
 # ==========================================
 def _key_status(key):
     db = get_db()
@@ -662,28 +698,66 @@ def _key_status(key):
     return row, "active"
 
 def _verify_payment_for_session(s, key_row, tolerance=0.0):
+    """
+    NEW V5 LOGIC:
+    - Supports PARTIAL payments (accumulates)
+    - Each QR session has unique session_id
+    - Once PAID, other QR with same amount won't be affected
+    """
     db = get_db()
-    ok, info, status = read_fampay_email(s['username'], s['amount'], s['order_id'], tolerance)
-
+    
+    # If already PAID or EXPIRED, skip
+    if s['status'] in ['PAID', 'EXPIRED']:
+        return False, None, s['status']
+    
+    # Check if this specific order is still within expiry
+    if time.time() > s['expires_at']:
+        db.execute("UPDATE qr_sessions SET status='EXPIRED' WHERE order_id=?", (s['order_id'],))
+        db.commit()
+        return False, None, "EXPIRED"
+    
+    # Calculate remaining amount needed (expected - already_paid)
+    already_paid = s['total_paid'] or 0
+    remaining = round(s['amount'] - already_paid, 2)
+    
+    if remaining <= tolerance:
+        # Fully paid from previous partial payments
+        db.execute("""UPDATE qr_sessions SET status='PAID', paid_at=? WHERE order_id=?""",
+                   (time.time(), s['order_id']))
+        db.commit()
+        return True, {
+            "txn_id": s['txn_id'], "utr": s['utr'],
+            "amount": already_paid, "expected": s['amount'],
+            "session_id": s['session_id'],
+            "sender_name": "", "sender_upi": "", "email_date": ""
+        }, "PAID"
+    
+    # Read emails - expected amount is remaining
+    ok, info, status = read_fampay_email(s['username'], remaining, s['order_id'], tolerance)
+    
     if status == "PAID" and ok:
-        db.execute("""UPDATE qr_sessions SET status='PAID',txn_id=?,utr=?,paid_amount=?,paid_at=?
+        # FULL payment received
+        new_total = round(already_paid + info['amount'], 2)
+        db.execute("""UPDATE qr_sessions SET status='PAID',txn_id=?,utr=?,paid_amount=?,total_paid=?,paid_at=?
                       WHERE order_id=?""",
-                   (info['txn_id'], info['utr'], info['amount'], time.time(), s['order_id']))
+                   (info['txn_id'], info['utr'], info['amount'], new_total, time.time(), s['order_id']))
         db.execute("UPDATE users SET total_earning=total_earning+? WHERE username=?",
                    (info['amount'], s['username']))
         db.execute("UPDATE api_keys SET total_received=total_received+? WHERE api_key=?",
                    (info['amount'], key_row['api_key']))
         try:
             db.execute("""INSERT INTO transactions 
-                          (username,order_id,amount,txn_id,utr,sender_name,sender_upi,email_date) 
-                          VALUES (?,?,?,?,?,?,?,?)""",
-                       (s['username'], s['order_id'], info['amount'], info['txn_id'], info['utr'],
+                          (username,order_id,session_id,amount,txn_id,utr,sender_name,sender_upi,email_date) 
+                          VALUES (?,?,?,?,?,?,?,?,?)""",
+                       (s['username'], s['order_id'], s['session_id'], info['amount'], 
+                        info['txn_id'], info['utr'],
                         info.get('sender_name',''), info.get('sender_upi',''), info.get('email_date','')))
         except sqlite3.IntegrityError:
             pass
         db.commit()
         notify_webhook(s['username'], "payment.success", {
-            "order_id": s['order_id'], "amount": info['amount'],
+            "order_id": s['order_id'], "session_id": s['session_id'],
+            "amount": info['amount'], "total_paid": new_total,
             "txn_id": info['txn_id'], "utr": info['utr'],
             "sender_name": info.get('sender_name',''),
             "sender_upi": info.get('sender_upi',''),
@@ -692,30 +766,65 @@ def _verify_payment_for_session(s, key_row, tolerance=0.0):
         return True, info, "PAID"
 
     elif status == "PARTIAL" and info:
+        # Partial payment received - accumulate
+        new_total = round(already_paid + info['amount'], 2)
+        new_short = round(s['amount'] - new_total, 2)
+        
+        # Update session with accumulated total
+        db.execute("""UPDATE qr_sessions SET 
+                      partial_amount=?, total_paid=?, short_by=?, overpaid=?, txn_id=?, utr=?
+                      WHERE order_id=?""",
+                   (info['amount'], new_total, new_short, 
+                    info.get('overpaid', 0), info['txn_id'], info['utr'], s['order_id']))
+        
+        # Record partial payment
         existing = db.execute("SELECT id FROM partial_payments WHERE txn_id=?",
                               (info['txn_id'],)).fetchone()
         if not existing:
             db.execute("""INSERT INTO partial_payments
-                          (order_id,username,expected,received,short_by,txn_id,utr)
-                          VALUES (?,?,?,?,?,?,?)""",
-                       (s['order_id'], s['username'], s['amount'],
-                        info['amount'], info.get('short_by', 0),
-                        info['txn_id'], info['utr']))
-            db.execute("""UPDATE qr_sessions SET partial_amount=?, short_by=?, overpaid=?, txn_id=?, utr=?
+                          (order_id,session_id,username,expected,received,short_by,txn_id,utr)
+                          VALUES (?,?,?,?,?,?,?,?)""",
+                       (s['order_id'], s['session_id'], s['username'], s['amount'],
+                        info['amount'], new_short, info['txn_id'], info['utr']))
+        
+        # If new_total >= expected, mark as PAID
+        if new_total + tolerance >= s['amount']:
+            db.execute("""UPDATE qr_sessions SET status='PAID', paid_amount=?, paid_at=?
                           WHERE order_id=?""",
-                       (info['amount'], info.get('short_by', 0),
-                        info.get('overpaid', 0), info['txn_id'], info['utr'], s['order_id']))
+                       (new_total, time.time(), s['order_id']))
+            db.execute("UPDATE users SET total_earning=total_earning+? WHERE username=?",
+                       (info['amount'], s['username']))
+            db.execute("UPDATE api_keys SET total_received=total_received+? WHERE api_key=?",
+                       (info['amount'], key_row['api_key']))
+            try:
+                db.execute("""INSERT INTO transactions 
+                              (username,order_id,session_id,amount,txn_id,utr,sender_name,sender_upi,email_date) 
+                              VALUES (?,?,?,?,?,?,?,?,?)""",
+                           (s['username'], s['order_id'], s['session_id'], info['amount'],
+                            info['txn_id'], info['utr'],
+                            info.get('sender_name',''), info.get('sender_upi',''), info.get('email_date','')))
+            except: pass
+            db.commit()
+            notify_webhook(s['username'], "payment.success", {
+                "order_id": s['order_id'], "session_id": s['session_id'],
+                "amount": info['amount'], "total_paid": new_total,
+                "txn_id": info['txn_id'], "utr": info['utr']
+            })
+            return True, {**info, "total_paid": new_total}, "PAID"
+        else:
             db.commit()
             notify_webhook(s['username'], "payment.partial", {
-                "order_id": s['order_id'], "expected": s['amount'],
-                "received": info['amount'], "short_by": info.get('short_by', 0)
+                "order_id": s['order_id'], "session_id": s['session_id'],
+                "expected": s['amount'], "received": info['amount'],
+                "total_paid": new_total, "short_by": new_short,
+                "txn_id": info['txn_id']
             })
-        return False, info, "PARTIAL"
+            return False, {**info, "total_paid": new_total, "short_by": new_short}, "PARTIAL"
 
     return False, None, status or "PENDING"
 
 # ==========================================
-# PUBLIC QR (V5 — with integration links)
+# PUBLIC QR - V5 WITH SESSION LINKS
 # ==========================================
 @app.route('/v2/fam/<path:api_key>')
 def fam_qr(api_key):
@@ -749,77 +858,111 @@ def fam_qr(api_key):
     minutes = int(request.args.get('minutes', user['default_qr_minutes'] or 15))
     upi = f"upi://pay?pa={user['upi_id']}&pn={user['full_name'] or user['username']}&am={amount}&cu=INR"
     order_id = gen_order_id()
+    session_id = gen_session_id()  # NEW: Random session ID
     now = time.time()
 
-    db.execute("""INSERT INTO qr_sessions (order_id,api_key,username,amount,created_at,expires_at)
-                  VALUES (?,?,?,?,?,?)""",
-               (order_id, key_row['api_key'], key_row['username'], amount, now, now + minutes*60))
+    db.execute("""INSERT INTO qr_sessions (order_id,session_id,api_key,username,amount,created_at,expires_at)
+                  VALUES (?,?,?,?,?,?,?)""",
+               (order_id, session_id, key_row['api_key'], key_row['username'], amount, now, now + minutes*60))
     db.commit()
-    audit(key_row['username'], "QR_GENERATED", f"order={order_id} amt={amount}")
+    audit(key_row['username'], "QR_GENERATED", f"order={order_id} session={session_id} amt={amount}")
 
     qr_image = qr_b64(upi)
     
-    telegram_url = build_url(f"/api/integration/telegram/{key_row['api_key']}")
-    website_url = build_url(f"/api/integration/website/{key_row['api_key']}")
-    check_url = build_url(f"/api/v2/check/{key_row['api_key']}?order_id={order_id}")
+    # Build session/result URLs
+    session_url = build_url(f"/result/{session_id}")
     
     return render_template_string(
         QR_HTML_TEMPLATE_V5,
-        amount=amount, qr_b64=qr_image, order_id=order_id,
+        amount=amount, qr_b64=qr_image, order_id=order_id, session_id=session_id,
         upi_id=user['upi_id'], full_name=user['full_name'] or user['username'],
         minutes=minutes, tolerance=user['tolerance'] or 0,
-        brand=APP_VERSION,
-        api_key=key_row['api_key'],
-        telegram_url=telegram_url,
-        website_url=website_url,
-        check_url=check_url
+        brand=APP_VERSION, session_url=session_url
     )
 
 # ==========================================
-# INTEGRATION PAGES (V5 NEW)
+# SESSION RESULT - JSON endpoint (for TG bot/webapp)
 # ==========================================
-@app.route('/api/integration/telegram/<api_key>')
-def integration_telegram(api_key):
-    key_row, status = _key_status(api_key)
-    if status != "active":
-        return render_template_string(ERROR_HTML, msg="❌ Invalid Key"), 403
-    
+@app.route('/result/<session_id>')
+def session_result(session_id):
+    """Universal session result page - can be opened by TG bot / webapp"""
     db = get_db()
-    user = db.execute("SELECT * FROM users WHERE username=?", (key_row['username'],)).fetchone()
-    base = build_url("")
+    s = db.execute("SELECT * FROM qr_sessions WHERE session_id=?", (session_id,)).fetchone()
+    if not s:
+        return render_template_string(ERROR_HTML, msg="❌ Invalid session ID"), 404
     
-    return render_template_string(
-        INTEGRATION_TELEGRAM_HTML,
-        api_key=api_key, base=base,
-        qr_url=f"{base}/v2/fam/{api_key}?qr=AMOUNT",
-        check_url=f"{base}/api/v2/check/{api_key}?order_id=ORDER_ID",
-        username=key_row['username'],
-        brand=APP_VERSION,
-        upi_id=user['upi_id'] if user else ''
+    # Get sender info from transaction if paid
+    txn = None
+    if s['status'] == 'PAID':
+        txn = db.execute("SELECT * FROM transactions WHERE order_id=? ORDER BY id DESC LIMIT 1",
+                         (s['order_id'],)).fetchone()
+    
+    # Return JSON for API clients (Accept: application/json or ?format=json)
+    want_json = (request.args.get('format') == 'json' or 
+                 'application/json' in request.headers.get('Accept', ''))
+    
+    if want_json:
+        return jsonify(_build_result_json(s, txn))
+    
+    # Return HTML page with auto-refresh
+    return render_template_string(SESSION_RESULT_HTML, 
+        session_id=session_id,
+        order_id=s['order_id'],
+        amount=s['amount'],
+        expected=s['amount'],
+        status=s['status'],
+        paid=s['paid_amount'] or 0,
+        total_paid=s['total_paid'] or 0,
+        short_by=s['short_by'] or 0,
+        txn_id=s['txn_id'] or '',
+        utr=s['utr'] or '',
+        sender_name=txn['sender_name'] if txn else '',
+        sender_upi=txn['sender_upi'] if txn else '',
+        email_date=txn['email_date'] if txn else '',
+        brand=APP_VERSION
     )
 
-@app.route('/api/integration/website/<api_key>')
-def integration_website(api_key):
-    key_row, status = _key_status(api_key)
-    if status != "active":
-        return render_template_string(ERROR_HTML, msg="❌ Invalid Key"), 403
+def _build_result_json(s, txn):
+    """Build JSON response for session result"""
+    result = {
+        "session_id": s['session_id'],
+        "order_id": s['order_id'],
+        "status": s['status'],
+        "expected": s['amount'],
+        "paid": s['paid_amount'] or 0,
+        "total_paid": s['total_paid'] or 0,
+        "short_by": s['short_by'] or 0,
+        "overpaid": s['overpaid'] or 0,
+        "txn_id": s['txn_id'] or '',
+        "utr": s['utr'] or '',
+        "verified": s['status'] == 'PAID',
+        "created_at": s['created_at'],
+        "expires_at": s['expires_at'],
+        "paid_at": s['paid_at'] or 0,
+        "seconds_left": int(max(0, s['expires_at'] - time.time())) if s['status'] == 'PENDING' else 0,
+    }
+    if txn:
+        result["sender_name"] = txn['sender_name'] or ''
+        result["sender_upi"] = txn['sender_upi'] or ''
+        result["email_date"] = txn['email_date'] or ''
+    else:
+        result["sender_name"] = ''
+        result["sender_upi"] = ''
+        result["email_date"] = ''
     
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE username=?", (key_row['username'],)).fetchone()
-    base = build_url("")
+    if s['status'] == 'PARTIAL':
+        result["message"] = f"⚠️ Payment incomplete. Paid ₹{s['total_paid']:.2f} of ₹{s['amount']:.2f}. Please pay ₹{s['short_by']:.2f} more."
+    elif s['status'] == 'PAID':
+        result["message"] = f"✅ Payment verified! ₹{s['paid_amount']:.2f} received."
+    elif s['status'] == 'EXPIRED':
+        result["message"] = "❌ Session expired"
+    else:
+        result["message"] = "⏳ Waiting for payment..."
     
-    return render_template_string(
-        INTEGRATION_WEBSITE_HTML,
-        api_key=api_key, base=base,
-        qr_url=f"{base}/v2/fam/{api_key}?qr=AMOUNT",
-        check_url=f"{base}/api/v2/check/{api_key}?order_id=ORDER_ID",
-        username=key_row['username'],
-        brand=APP_VERSION,
-        upi_id=user['upi_id'] if user else ''
-    )
+    return result
 
 # ==========================================
-# JSON CHECK (V5)
+# JSON CHECK API (V2 compatibility)
 # ==========================================
 @app.route('/api/v2/check/<path:api_key>')
 def api_check_v2(api_key):
@@ -829,7 +972,12 @@ def api_check_v2(api_key):
 
     db = get_db()
     order_id = request.args.get('order_id')
-    if order_id:
+    session_id = request.args.get('session_id')
+    
+    if session_id:
+        s = db.execute("SELECT * FROM qr_sessions WHERE session_id=? AND api_key=?",
+                       (session_id, key_row['api_key'])).fetchone()
+    elif order_id:
         s = db.execute("SELECT * FROM qr_sessions WHERE order_id=? AND api_key=?",
                        (order_id, key_row['api_key'])).fetchone()
     else:
@@ -839,41 +987,37 @@ def api_check_v2(api_key):
     if not s:
         return jsonify({"status": "NOTFOUND"})
 
+    # Handle terminal states
     if s['status'] == 'PAID':
-        t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
+        txn = db.execute("SELECT * FROM transactions WHERE order_id=? ORDER BY id DESC LIMIT 1",
+                         (s['order_id'],)).fetchone()
         return jsonify({
-            "status": "PAID", "order_id": s['order_id'],
+            "status": "PAID", "order_id": s['order_id'], "session_id": s['session_id'],
             "amount": s['paid_amount'] or s['amount'],
             "expected": s['amount'], "paid": s['paid_amount'] or s['amount'],
+            "total_paid": s['total_paid'] or s['amount'],
             "txn_id": s['txn_id'], "utr": s['utr'],
-            "sender_name": t['sender_name'] if t else '',
-            "sender_upi": t['sender_upi'] if t else '',
-            "email_date": t['email_date'] if t else '',
+            "sender_name": txn['sender_name'] if txn else '',
+            "sender_upi": txn['sender_upi'] if txn else '',
+            "email_date": txn['email_date'] if txn else '',
             "verified": True
         })
 
     if s['status'] == 'PARTIAL':
-        short = s['short_by'] or 0
-        over = s['overpaid'] or 0
-        msg = ""
-        if short > 0:
-            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f}. Please pay remaining ₹{short:.2f} to complete."
-        elif over > 0:
-            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f} — overpaid by ₹{over:.2f}."
         return jsonify({
-            "status": "PARTIAL", "order_id": s['order_id'],
+            "status": "PARTIAL", "order_id": s['order_id'], "session_id": s['session_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": short, "overpaid": over,
+            "total_paid": s['total_paid'] or s['partial_amount'],
+            "short_by": s['short_by'], "overpaid": s['overpaid'],
             "txn_id": s['txn_id'], "utr": s['utr'], "verified": False,
-            "message": msg,
-            "qr_still_active": time.time() <= s['expires_at']
+            "message": f"Please pay remaining ₹{s['short_by']:.2f}" if s['short_by'] > 0 else f"Overpaid ₹{s['overpaid']:.2f}"
         })
 
     if s['status'] == 'EXPIRED' or time.time() > s['expires_at']:
         if s['status'] != 'EXPIRED':
             db.execute("UPDATE qr_sessions SET status='EXPIRED' WHERE order_id=?", (s['order_id'],))
             db.commit()
-        return jsonify({"status": "EXPIRED", "order_id": s['order_id']})
+        return jsonify({"status": "EXPIRED", "order_id": s['order_id'], "session_id": s['session_id']})
 
     user = db.execute("SELECT tolerance FROM users WHERE username=?", (s['username'],)).fetchone()
     tol = (user['tolerance'] if user else 0) or 0
@@ -881,36 +1025,28 @@ def api_check_v2(api_key):
     s = db.execute("SELECT * FROM qr_sessions WHERE order_id=?", (s['order_id'],)).fetchone()
 
     if s['status'] == 'PAID':
-        t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
+        txn = db.execute("SELECT * FROM transactions WHERE order_id=? ORDER BY id DESC LIMIT 1",
+                         (s['order_id'],)).fetchone()
         return jsonify({
-            "status": "PAID", "order_id": s['order_id'],
+            "status": "PAID", "order_id": s['order_id'], "session_id": s['session_id'],
             "amount": s['paid_amount'], "expected": s['amount'],
+            "total_paid": s['total_paid'],
             "txn_id": s['txn_id'], "utr": s['utr'],
-            "sender_name": t['sender_name'] if t else '',
-            "sender_upi": t['sender_upi'] if t else '',
-            "email_date": t['email_date'] if t else '',
+            "sender_name": txn['sender_name'] if txn else '',
+            "sender_upi": txn['sender_upi'] if txn else '',
+            "email_date": txn['email_date'] if txn else '',
             "verified": True
         })
     if s['status'] == 'PARTIAL':
-        short = s['short_by'] or 0
-        over = s['overpaid'] or 0
-        msg = ""
-        if short > 0:
-            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f}. Please pay remaining ₹{short:.2f} to complete."
-        elif over > 0:
-            msg = f"⚠️ You paid ₹{s['partial_amount']:.2f} — overpaid by ₹{over:.2f}."
         return jsonify({
-            "status": "PARTIAL", "order_id": s['order_id'],
+            "status": "PARTIAL", "order_id": s['order_id'], "session_id": s['session_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": short, "overpaid": over,
-            "txn_id": s['txn_id'], "utr": s['utr'],
-            "verified": False,
-            "message": msg,
-            "qr_still_active": time.time() <= s['expires_at']
+            "total_paid": s['total_paid'],
+            "short_by": s['short_by'], "verified": False
         })
 
     return jsonify({
-        "status": "PENDING", "order_id": s['order_id'],
+        "status": "PENDING", "order_id": s['order_id'], "session_id": s['session_id'],
         "seconds_left": int(max(0, s['expires_at']-time.time()))
     })
 
@@ -923,36 +1059,30 @@ def check_payment(order_id):
 
     if s['status'] == 'PAID':
         t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
-        return jsonify({"status": "PAID", "txn": {
+        return jsonify({"status": "PAID", "session_id": s['session_id'], "txn": {
             "txn_id": s['txn_id'], "utr": s['utr'],
             "amount": s['paid_amount'] or s['amount'],
+            "total_paid": s['total_paid'] or s['amount'],
             "sender_name": t['sender_name'] if t else '',
             "sender_upi": t['sender_upi'] if t else '',
             "email_date": t['email_date'] if t else '',
-            "order_id": s['order_id']
+            "order_id": s['order_id'],
+            "session_id": s['session_id']
         }})
 
     if s['status'] == 'PARTIAL':
-        short = s['short_by'] or 0
-        over = s['overpaid'] or 0
-        msg = ""
-        if short > 0:
-            msg = f"⚠️ Short by ₹{short:.2f}. Please pay remaining amount."
-        elif over > 0:
-            msg = f"⚠️ Overpaid by ₹{over:.2f}."
-        return jsonify({"status": "PARTIAL",
+        return jsonify({"status": "PARTIAL", "session_id": s['session_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": short, "overpaid": over,
-            "txn_id": s['txn_id'], "utr": s['utr'],
-            "message": msg,
-            "qr_still_active": time.time() <= s['expires_at']
+            "total_paid": s['total_paid'] or s['partial_amount'],
+            "short_by": s['short_by'],
+            "message": f"⚠️ Short by ₹{s['short_by']:.2f}. Please pay ₹{s['short_by']:.2f} more."
         })
 
     if time.time() > s['expires_at']:
         if s['status'] != 'EXPIRED':
             db.execute("UPDATE qr_sessions SET status='EXPIRED' WHERE order_id=?", (order_id,))
             db.commit()
-        return jsonify({"status": "EXPIRED"})
+        return jsonify({"status": "EXPIRED", "session_id": s['session_id']})
 
     key_row = db.execute("SELECT * FROM api_keys WHERE api_key=?", (s['api_key'],)).fetchone()
     if not key_row:
@@ -965,30 +1095,23 @@ def check_payment(order_id):
     s = db.execute("SELECT * FROM qr_sessions WHERE order_id=?", (order_id,)).fetchone()
     if s['status'] == 'PAID':
         t = db.execute("SELECT * FROM transactions WHERE txn_id=?", (s['txn_id'],)).fetchone()
-        return jsonify({"status": "PAID", "txn": {
+        return jsonify({"status": "PAID", "session_id": s['session_id'], "txn": {
             "txn_id": s['txn_id'], "utr": s['utr'],
             "amount": s['paid_amount'],
+            "total_paid": s['total_paid'],
             "sender_name": t['sender_name'] if t else '',
             "sender_upi": t['sender_upi'] if t else '',
             "email_date": t['email_date'] if t else '',
-            "order_id": s['order_id']
+            "order_id": s['order_id'],
+            "session_id": s['session_id']
         }})
     if s['status'] == 'PARTIAL':
-        short = s['short_by'] or 0
-        over = s['overpaid'] or 0
-        msg = ""
-        if short > 0:
-            msg = f"⚠️ Short by ₹{short:.2f}. Please pay remaining."
-        elif over > 0:
-            msg = f"⚠️ Overpaid by ₹{over:.2f}."
-        return jsonify({"status": "PARTIAL",
+        return jsonify({"status": "PARTIAL", "session_id": s['session_id'],
             "expected": s['amount'], "received": s['partial_amount'],
-            "short_by": short, "overpaid": over,
-            "txn_id": s['txn_id'], "utr": s['utr'],
-            "message": msg,
-            "qr_still_active": time.time() <= s['expires_at']
+            "total_paid": s['total_paid'],
+            "short_by": s['short_by']
         })
-    return jsonify({"status": "PENDING"})
+    return jsonify({"status": "PENDING", "session_id": s['session_id']})
 
 # ==========================================
 # UPTIME
@@ -1019,7 +1142,109 @@ h2{color:#ff4757;margin-bottom:12px}p{color:#7a7a9a}</style></head>
 """
 
 # ==========================================
-# QR PAGE V5 — with integration links
+# SESSION RESULT HTML (auto-refreshes, works in TG webapp)
+# ==========================================
+SESSION_RESULT_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment Result · {{ session_id }}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif}
+body{background:radial-gradient(circle at 30% 20%,rgba(0,224,164,.18),transparent 45%),
+radial-gradient(circle at 70% 80%,rgba(168,85,247,.18),transparent 45%),#05050a;
+color:#e8e8f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:100%;max-width:460px;background:rgba(15,15,30,.9);backdrop-filter:blur(20px);
+border:1px solid rgba(0,255,179,.25);border-radius:24px;padding:32px 26px;
+box-shadow:0 0 60px rgba(0,224,164,.25);text-align:center}
+.tag{font-size:11px;color:#00e0a4;text-transform:uppercase;letter-spacing:3px;margin-bottom:8px;font-weight:700}
+.sid{font-family:'Space Mono',monospace;font-size:12px;color:#7a7a9a;margin-bottom:20px;word-break:break-all;
+padding:8px 12px;background:rgba(21,21,42,.8);border-radius:8px;border:1px solid #1f1f3a}
+.status-icon{font-size:64px;margin:10px 0}
+.status-title{font-size:26px;font-weight:900;margin-bottom:8px}
+.status-title.paid{color:#00e0a4;text-shadow:0 0 30px rgba(0,224,164,.6)}
+.status-title.pending{color:#ffa502}
+.status-title.partial{color:#ffa502}
+.status-title.expired{color:#ff4757}
+.amount{font-size:44px;font-weight:900;margin:8px 0;
+background:linear-gradient(90deg,#00ffb3,#00d4ff);background-size:200% 100%;
+-webkit-background-clip:text;color:transparent;animation:rbow 3s linear infinite}
+@keyframes rbow{to{background-position:200% 0}}
+.msg{color:#7a7a9a;font-size:14px;margin-bottom:20px;line-height:1.6;padding:0 10px}
+.details{background:rgba(21,21,42,.8);border:1px solid rgba(0,255,179,.2);border-radius:14px;
+padding:18px;text-align:left;font-size:12px;font-family:'Space Mono',monospace}
+.details div{display:flex;justify-content:space-between;margin-bottom:10px;color:#7a7a9a;gap:12px}
+.details div:last-child{margin-bottom:0}
+.details b{color:#e8e8f5;font-weight:700;text-align:right;word-break:break-all}
+.details b.ok{color:#00e0a4}
+.details b.warn{color:#ffa502}
+.details b.err{color:#ff4757}
+.refresh{margin-top:16px;font-size:11px;color:#3a3a5a;font-family:'Space Mono',monospace}
+.brand{position:fixed;bottom:12px;right:16px;font-size:10px;color:#3a3a5a;letter-spacing:2px;font-family:'Space Mono',monospace}
+</style></head><body>
+<div class="card">
+    <div class="tag">◆ Payment Session</div>
+    <div class="sid">🔖 {{ session_id }}</div>
+    
+    {% if status == 'PAID' %}
+        <div class="status-icon">✅</div>
+        <div class="status-title paid">Payment Verified</div>
+        <div class="amount">₹{{ "%.2f"|format(total_paid or paid or amount) }}</div>
+        <div class="msg">Payment successfully verified from your Gmail account.</div>
+    {% elif status == 'PARTIAL' %}
+        <div class="status-icon">⚠️</div>
+        <div class="status-title partial">Payment Incomplete</div>
+        <div class="amount">₹{{ "%.2f"|format(total_paid) }} / ₹{{ "%.2f"|format(expected) }}</div>
+        <div class="msg">You have paid ₹{{ "%.2f"|format(total_paid) }}. Please pay <b style="color:#ffa502">₹{{ "%.2f"|format(short_by) }}</b> more to complete verification.</div>
+    {% elif status == 'EXPIRED' %}
+        <div class="status-icon">⏱</div>
+        <div class="status-title expired">Session Expired</div>
+        <div class="msg">This payment session has expired. Please generate a new QR.</div>
+    {% else %}
+        <div class="status-icon">⏳</div>
+        <div class="status-title pending">Waiting for Payment</div>
+        <div class="amount">₹{{ "%.2f"|format(amount) }}</div>
+        <div class="msg">Waiting for your payment to be detected...</div>
+    {% endif %}
+    
+    <div class="details">
+        <div><span>Session ID</span><b>{{ session_id }}</b></div>
+        <div><span>Order ID</span><b>{{ order_id }}</b></div>
+        <div><span>Expected</span><b>₹{{ "%.2f"|format(expected) }}</b></div>
+        {% if total_paid > 0 %}
+        <div><span>Total Paid</span><b class="ok">₹{{ "%.2f"|format(total_paid) }}</b></div>
+        {% endif %}
+        {% if status == 'PARTIAL' and short_by > 0 %}
+        <div><span>Short By</span><b class="warn">₹{{ "%.2f"|format(short_by) }}</b></div>
+        {% endif %}
+        {% if txn_id %}
+        <div><span>Transaction ID</span><b>{{ txn_id }}</b></div>
+        {% endif %}
+        {% if utr %}
+        <div><span>UTR</span><b>{{ utr }}</b></div>
+        {% endif %}
+        {% if sender_name %}
+        <div><span>Sender Name</span><b>{{ sender_name }}</b></div>
+        {% endif %}
+        {% if sender_upi %}
+        <div><span>Sender UPI</span><b>{{ sender_upi }}</b></div>
+        {% endif %}
+        {% if email_date %}
+        <div><span>Email Date</span><b>{{ email_date }}</b></div>
+        {% endif %}
+        <div><span>Status</span><b class="{% if status == 'PAID' %}ok{% elif status == 'PARTIAL' %}warn{% elif status == 'EXPIRED' %}err{% endif %}">{{ status }}</b></div>
+    </div>
+    
+    {% if status not in ['PAID', 'EXPIRED'] %}
+    <div class="refresh">🔄 Auto-refreshing every 3 seconds...</div>
+    <script>setTimeout(()=>location.reload(), 3000);</script>
+    {% endif %}
+</div>
+<div class="brand">FamPay AutoQR V{{ brand }}</div>
+</body></html>
+"""
+
+# ==========================================
+# QR PAGE V5 — WITH SESSION LINKS
 # ==========================================
 QR_HTML_TEMPLATE_V5 = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1039,10 +1264,6 @@ border:1px solid rgba(0,255,179,.2);border-radius:24px;padding:32px 26px;
 box-shadow:0 0 60px rgba(0,224,164,.2),0 0 120px rgba(168,85,247,.15);
 text-align:center;position:relative;overflow:hidden;animation:cardIn .6s cubic-bezier(.175,.885,.32,1.275)}
 @keyframes cardIn{0%{transform:scale(.9);opacity:0}100%{transform:scale(1);opacity:1}}
-.card::before{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
-background:conic-gradient(from 0deg,transparent,rgba(0,255,179,.1),transparent 30%);
-animation:rotateGlow 8s linear infinite;z-index:-1}
-@keyframes rotateGlow{to{transform:rotate(360deg)}}
 .tag{font-size:12px;color:#00e0a4;text-transform:uppercase;letter-spacing:3px;margin-bottom:8px;font-weight:700;
 text-shadow:0 0 20px rgba(0,255,179,.5)}
 h1{font-size:48px;font-weight:900;margin:8px 0;
@@ -1050,6 +1271,9 @@ background:linear-gradient(90deg,#00ffb3,#a855f7,#ff00aa,#00d4ff);background-siz
 -webkit-background-clip:text;color:transparent;animation:rbow 4s linear infinite;
 filter:drop-shadow(0 0 20px rgba(0,255,179,.4))}
 @keyframes rbow{to{background-position:300% 0}}
+.sid-badge{display:inline-block;font-family:'Space Mono',monospace;font-size:10px;
+padding:6px 12px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.4);
+border-radius:20px;color:#a855f7;margin-top:6px;letter-spacing:1px;word-break:break-all;max-width:100%}
 .qr-wrap{background:#fff;border-radius:20px;padding:14px;display:inline-block;margin:18px 0;
 box-shadow:0 0 60px rgba(0,224,164,.4),inset 0 0 20px rgba(0,0,0,.05);
 position:relative;animation:qrPulse 3s ease-in-out infinite}
@@ -1057,137 +1281,149 @@ position:relative;animation:qrPulse 3s ease-in-out infinite}
 .qr-wrap img{display:block;width:230px;height:230px;border-radius:8px}
 .logos{display:flex;justify-content:center;gap:8px;margin:16px 0;flex-wrap:wrap}
 .logos span{background:rgba(255,255,255,.95);color:#000;padding:7px 12px;border-radius:9px;
-font-weight:800;font-size:11px;transition:.3s;cursor:default}
-.logos span:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(0,255,179,.4)}
+font-weight:800;font-size:11px}
 .timer{font-size:34px;font-weight:900;margin:12px 0;color:#00e0a4;
 letter-spacing:2px;font-variant-numeric:tabular-nums;font-family:'Space Mono',monospace;
 text-shadow:0 0 20px rgba(0,255,179,.5)}
-.status{padding:16px;border-radius:14px;font-weight:700;font-size:14px;margin-top:10px;
-transition:.3s;backdrop-filter:blur(10px)}
+.status{padding:16px;border-radius:14px;font-weight:700;font-size:14px;margin-top:10px}
 .pending{background:rgba(255,165,2,.15);color:#ffa502;border:1px solid rgba(255,165,2,.3);
 animation:pendingPulse 2s ease-in-out infinite}
 @keyframes pendingPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,165,2,.4)}50%{box-shadow:0 0 0 10px rgba(255,165,2,0)}}
 .expired{background:rgba(255,71,87,.15);color:#ff4757;border:1px solid rgba(255,71,87,.3)}
-.upi{font-size:12px;color:#7a7a9a;margin-top:10px}.upi b{color:#e8e8f5}
 .success-overlay{position:absolute;inset:0;background:rgba(15,15,30,.98);backdrop-filter:blur(30px);
-border-radius:24px;display:none;flex-direction:column;align-items:center;justify-content:center;
-padding:32px 26px;z-index:10;opacity:0;transition:.5s}
+border-radius:24px;display:none;flex-direction:column;align-items:center;justify-content:flex-start;
+padding:32px 26px;z-index:10;opacity:0;transition:.5s;overflow-y:auto}
 .success-overlay.show{display:flex;opacity:1}
 .check-icon{width:100px;height:100px;border-radius:50%;
 background:radial-gradient(circle,rgba(0,224,164,.3),rgba(0,224,164,.05));
 border:3px solid #00e0a4;display:flex;align-items:center;justify-content:center;
-font-size:50px;margin-bottom:22px;
+font-size:50px;margin-bottom:22px;flex-shrink:0;
 box-shadow:0 0 40px rgba(0,224,164,.7),inset 0 0 20px rgba(0,224,164,.3);
-animation:popIn .6s cubic-bezier(.175,.885,.32,1.275),checkPulse 2s ease-in-out 0.6s infinite}
+animation:popIn .6s cubic-bezier(.175,.885,.32,1.275)}
 @keyframes popIn{0%{transform:scale(0) rotate(-180deg)}100%{transform:scale(1) rotate(0)}}
-@keyframes checkPulse{0%,100%{box-shadow:0 0 40px rgba(0,224,164,.7)}50%{box-shadow:0 0 80px rgba(0,224,164,1)}}
 .success-title{font-size:28px;font-weight:900;color:#00e0a4;margin-bottom:8px;
-text-shadow:0 0 30px rgba(0,224,164,.5);letter-spacing:.5px}
+text-shadow:0 0 30px rgba(0,224,164,.5)}
 .success-amt{font-size:46px;font-weight:900;
 background:linear-gradient(90deg,#00ffb3,#00d4ff);background-size:200% 100%;
 -webkit-background-clip:text;color:transparent;margin-bottom:22px;
-animation:rbow 3s linear infinite;filter:drop-shadow(0 0 20px rgba(0,255,179,.6))}
+animation:rbow 3s linear infinite}
 .success-details{background:rgba(21,21,42,.8);backdrop-filter:blur(10px);
 border:1px solid rgba(0,255,179,.25);border-radius:14px;padding:18px;width:100%;
-text-align:left;font-size:12px;font-family:'Space Mono',monospace}
+text-align:left;font-size:12px;font-family:'Space Mono',monospace;margin-bottom:16px}
 .success-details div{display:flex;justify-content:space-between;margin-bottom:10px;color:#7a7a9a;gap:12px}
 .success-details div:last-child{margin-bottom:0}
 .success-details b{color:#e8e8f5;font-weight:700;text-align:right;word-break:break-all}
-.success-details .ok{color:#00e0a4;font-weight:800}
+.success-details .ok{color:#00e0a4}
+
+/* SESSION LINKS BOX - V5 NEW */
+.session-links{width:100%;margin-top:16px;animation:linksIn .6s .3s both}
+@keyframes linksIn{0%{opacity:0;transform:translateY(20px)}100%{opacity:1;transform:translateY(0)}}
+.links-title{font-size:11px;color:#7a7a9a;text-transform:uppercase;letter-spacing:2px;
+margin-bottom:10px;text-align:left;font-weight:700}
+.link-item{display:flex;align-items:center;gap:10px;background:rgba(21,21,42,.8);
+border:1px solid rgba(0,255,179,.25);border-radius:12px;padding:12px 14px;margin-bottom:8px;
+transition:.2s;cursor:pointer;text-align:left}
+.link-item:hover{border-color:#00e0a4;box-shadow:0 0 20px rgba(0,224,164,.3);transform:translateX(3px)}
+.link-item .ic{font-size:20px;flex-shrink:0}
+.link-item .info{flex:1;min-width:0}
+.link-item .lbl{font-size:12px;font-weight:700;color:#e8e8f5;margin-bottom:2px}
+.link-item .url{font-size:10px;color:#00e0a4;font-family:'Space Mono',monospace;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-item .arrow{color:#7a7a9a;font-size:14px}
+
 .partial-overlay{position:absolute;inset:0;background:rgba(15,15,30,.98);backdrop-filter:blur(30px);
-border-radius:24px;display:none;flex-direction:column;align-items:center;justify-content:center;
-padding:32px 26px;z-index:10;opacity:0;transition:.5s}
+border-radius:24px;display:none;flex-direction:column;align-items:center;justify-content:flex-start;
+padding:32px 26px;z-index:10;opacity:0;transition:.5s;overflow-y:auto}
 .partial-overlay.show{display:flex;opacity:1}
-.warn-icon{width:100px;height:100px;border-radius:50%;
+.warn-icon{width:100px;height:100px;border-radius:50%;flex-shrink:0;
 background:radial-gradient(circle,rgba(255,165,2,.3),rgba(255,165,2,.05));
 border:3px solid #ffa502;display:flex;align-items:center;justify-content:center;
 font-size:50px;margin-bottom:22px;box-shadow:0 0 40px rgba(255,165,2,.7)}
-.warn-title{font-size:24px;font-weight:900;color:#ffa502;margin-bottom:8px;
+.warn-title{font-size:26px;font-weight:900;color:#ffa502;margin-bottom:8px;
 text-shadow:0 0 30px rgba(255,165,2,.5)}
-.warn-msg{color:#e8e8f5;font-size:14px;margin-bottom:18px;text-align:center;line-height:1.6;
-padding:10px 14px;background:rgba(255,165,2,.1);border-radius:10px;border:1px solid rgba(255,165,2,.2)}
+.warn-msg{color:#e8e8f5;font-size:14px;margin-bottom:18px;text-align:center;line-height:1.6}
+.warn-msg b{color:#ffa502;font-size:16px}
 .warn-details{background:rgba(21,21,42,.8);backdrop-filter:blur(10px);
 border:1px solid rgba(255,165,2,.25);border-radius:14px;padding:18px;width:100%;
 font-size:13px;margin-bottom:18px;font-family:'Space Mono',monospace}
 .warn-details div{display:flex;justify-content:space-between;margin-bottom:10px}
 .warn-details div:last-child{margin-bottom:0}
 .warn-details b{color:#ffa502}
-.integration-box{margin-top:20px;text-align:left}
-.integration-title{font-size:11px;font-weight:800;color:#7a7a9a;text-transform:uppercase;
-letter-spacing:1.5px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
-.integration-link{background:rgba(2,2,10,.8);border:1px dashed rgba(0,255,179,.4);
-padding:10px 12px;border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;
-font-size:11px;word-break:break-all;display:flex;justify-content:space-between;
-align-items:center;gap:8px;margin-bottom:8px;transition:.2s;cursor:pointer}
-.integration-link:hover{background:rgba(0,255,179,.08);border-color:rgba(0,255,179,.6);
-box-shadow:0 0 20px rgba(0,255,179,.2)}
-.integration-link span{flex:1}
-.integration-link .copy-btn{background:rgba(0,255,179,.15);color:#00ffb3;
-padding:4px 8px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid rgba(0,255,179,.3);cursor:pointer;flex-shrink:0}
-.integration-link .copy-btn:hover{background:rgba(0,255,179,.3)}
-.integration-tag{font-size:10px;color:#7a7a9a;margin-top:-4px;margin-bottom:10px;padding-left:2px}
+.qr-still-valid{background:rgba(0,224,164,.1);border:1px solid rgba(0,224,164,.3);
+padding:10px;border-radius:10px;font-size:12px;color:#00e0a4;margin-top:14px;text-align:center}
 .brand{position:fixed;bottom:12px;right:16px;font-size:10px;color:#3a3a5a;letter-spacing:2px;
 font-family:'Space Mono',monospace}
 </style></head><body>
 <div class="card" id="mainCard">
     <div class="tag">◆ Pay via UPI</div>
     <h1>₹{{ "%.2f"|format(amount) }}</h1>
-    <div class="upi">to <b>{{ full_name }}</b> · {{ upi_id }}</div>
+    <div style="font-size:12px;color:#7a7a9a;margin-top:4px">to <b style="color:#e8e8f5">{{ full_name }}</b> · {{ upi_id }}</div>
+    <div class="sid-badge">🔖 {{ session_id }}</div>
     <div class="qr-wrap" id="qrWrap"><img src="{{ qr_b64 }}" alt="QR"></div>
     <div class="logos"><span>GPay</span><span>PhonePe</span><span>Paytm</span><span>UPI</span><span>BHIM</span></div>
     <div class="timer" id="timer">{{ '%02d:00'|format(minutes) }}</div>
     <div class="status pending" id="status">⏳ Waiting for payment of ₹{{ "%.2f"|format(amount) }}...</div>
 
-    <div class="integration-box">
-        <div class="integration-title">🤖 Telegram Bot Integration</div>
-        <div class="integration-link" onclick="copyText('{{ telegram_url }}')">
-            <span>{{ telegram_url }}</span>
-            <button class="copy-btn">Copy</button>
-        </div>
-        <div class="integration-tag">Python / Node.js / PHP — all supported</div>
-
-        <div class="integration-title">🌐 Website / App Integration</div>
-        <div class="integration-link" onclick="copyText('{{ website_url }}')">
-            <span>{{ website_url }}</span>
-            <button class="copy-btn">Copy</button>
-        </div>
-        <div class="integration-tag">HTML / PHP / React / Vue / Angular — all supported</div>
-    </div>
-
+    <!-- SUCCESS OVERLAY -->
     <div class="success-overlay" id="successOverlay">
         <div class="check-icon">✅</div>
-        <div class="success-title">Payment Successful</div>
+        <div class="success-title">Payment Verified</div>
         <div class="success-amt" id="successAmt">₹{{ amount }}</div>
         <div class="success-details">
             <div><span>Amount</span><b id="dtAmount">-</b></div>
             <div><span>Transaction ID</span><b id="dtTxn">-</b></div>
             <div><span>UTR</span><b id="dtUtr">-</b></div>
             <div><span>Sender</span><b id="dtSender">-</b></div>
-            <div><span>Sender UPI</span><b id="dtSenderUpi">-</b></div>
             <div><span>Date</span><b id="dtDate">-</b></div>
             <div><span>Status</span><b class="ok">Verified ✅</b></div>
         </div>
+        
+        <div class="session-links">
+            <div class="links-title">◆ Session Links</div>
+            <a class="link-item" id="tgLink" href="#" target="_blank">
+                <div class="ic">📱</div>
+                <div class="info">
+                    <div class="lbl">Telegram Bot Result</div>
+                    <div class="url" id="tgUrl">Loading...</div>
+                </div>
+                <div class="arrow">↗</div>
+            </a>
+            <a class="link-item" id="webLink" href="{{ session_url }}" target="_blank">
+                <div class="ic">🌐</div>
+                <div class="info">
+                    <div class="lbl">Website / App Result</div>
+                    <div class="url" id="webUrl">{{ session_url }}</div>
+                </div>
+                <div class="arrow">↗</div>
+            </a>
+            <a class="link-item" id="jsonLink" href="{{ session_url }}?format=json" target="_blank">
+                <div class="ic">📋</div>
+                <div class="info">
+                    <div class="lbl">JSON Result (API)</div>
+                    <div class="url">{{ session_url }}?format=json</div>
+                </div>
+                <div class="arrow">↗</div>
+            </a>
+        </div>
     </div>
 
+    <!-- PARTIAL OVERLAY -->
     <div class="partial-overlay" id="partialOverlay">
         <div class="warn-icon">⚠️</div>
-        <div class="warn-title" id="partialTitle">Payment Incomplete</div>
-        <div class="warn-msg" id="partialMsg">You paid less than required. Please pay the remaining amount to complete verification.</div>
+        <div class="warn-title">Payment Incomplete</div>
+        <div class="warn-msg" id="partialMsg">You paid less than required.</div>
         <div class="warn-details">
             <div><span>Expected</span><b>₹{{ "%.2f"|format(amount) }}</b></div>
-            <div><span>Received</span><b id="partialRecv">₹0.00</b></div>
+            <div><span>Total Paid</span><b id="partialTotal">₹0.00</b></div>
             <div><span>Remaining</span><b id="partialShort">₹0.00</b></div>
             <div><span>Txn ID</span><b id="partialTxn" style="color:#e8e8f5">-</b></div>
         </div>
-        <button onclick="closePartial()" style="background:rgba(255,165,2,.2);border:1px solid rgba(255,165,2,.4);
-        color:#ffa502;padding:10px 20px;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;">
-        Pay Remaining ₹<span id="partialBtnAmt">0.00</span>
-        </button>
+        <div class="qr-still-valid">✅ QR is still valid. Pay remaining amount to complete verification.</div>
     </div>
 </div>
 <div class="brand">FamPay AutoQR V{{ brand }}</div>
 <script>
-const orderId="{{ order_id }}", totalSecs={{ minutes*60 }}, expectedAmt={{ amount }};
+const orderId="{{ order_id }}", sessionId="{{ session_id }}", totalSecs={{ minutes*60 }}, expectedAmt={{ amount }};
 let secs=totalSecs, tInt, pInt;
 const T=document.getElementById('timer'), S=document.getElementById('status');
 function tick(){
@@ -1200,44 +1436,37 @@ function tick(){
     const m=String(Math.floor(secs/60)).padStart(2,'0'), s=String(secs%60).padStart(2,'0');
     T.textContent=m+':'+s; if(secs<=60) T.style.color='#ff4757';
 }
-let partialShown = false, partialDismissed = false;
-function closePartial(){
-    document.getElementById('partialOverlay').classList.remove('show');
-    partialDismissed = true;
-}
+let partialShown = false;
 async function poll(){
     try{
         const r=await fetch('/api/check-payment/'+orderId), d=await r.json();
         if(d.status==='PAID'){
-            document.getElementById('successAmt').textContent = '₹' + (d.txn.amount||expectedAmt);
-            document.getElementById('dtAmount').textContent = '₹' + (d.txn.amount||expectedAmt);
+            document.getElementById('successAmt').textContent = '₹' + (d.txn.amount||expectedAmt).toFixed(2);
+            document.getElementById('dtAmount').textContent = '₹' + (d.txn.amount||expectedAmt).toFixed(2);
             document.getElementById('dtTxn').textContent = d.txn.txn_id || '-';
             document.getElementById('dtUtr').textContent = d.txn.utr || '-';
-            document.getElementById('dtSender').textContent = d.txn.sender_name || '-';
-            document.getElementById('dtSenderUpi').textContent = d.txn.sender_upi || '-';
-            document.getElementById('dtDate').textContent = d.txn.email_date || new Date().toLocaleString('en-IN', {hour:'2-digit', minute:'2-digit', hour12:true}) + ' IST';
+            document.getElementById('dtSender').textContent = (d.txn.sender_name || '') + ' ' + (d.txn.sender_upi || '');
+            document.getElementById('dtDate').textContent = d.txn.email_date || new Date().toLocaleString('en-IN') + ' IST';
+            
+            // Setup Telegram link - opens session result JSON
+            const sessUrl = window.location.origin + '/result/' + sessionId;
+            document.getElementById('tgUrl').textContent = 'Open in Telegram → ' + sessionId;
+            document.getElementById('tgLink').href = sessUrl + '?format=json';
+            document.getElementById('webUrl').textContent = sessUrl;
+            document.getElementById('webLink').href = sessUrl;
+            
             document.getElementById('successOverlay').classList.add('show');
             clearInterval(tInt); clearInterval(pInt);
         }
-        else if(d.status==='PARTIAL' && !partialDismissed){
-            document.getElementById('partialRecv').textContent = '₹' + (d.received||0).toFixed(2);
-            const short = d.short_by||0;
-            const over = d.overpaid||0;
-            if(short > 0){
-                document.getElementById('partialShort').textContent = '₹' + short.toFixed(2);
-                document.getElementById('partialBtnAmt').textContent = short.toFixed(2);
-                document.getElementById('partialTitle').textContent = 'Payment Incomplete';
-                document.getElementById('partialMsg').textContent = d.message || 'Please pay remaining amount to complete verification.';
-            } else if(over > 0){
-                document.getElementById('partialShort').textContent = '₹0.00';
-                document.getElementById('partialBtnAmt').textContent = '0.00';
-                document.getElementById('partialTitle').textContent = 'Overpaid';
-                document.getElementById('partialMsg').textContent = d.message || 'You paid more than expected.';
-            }
+        else if(d.status==='PARTIAL' && !partialShown){
+            partialShown = true;
+            document.getElementById('partialTotal').textContent = '₹' + (d.total_paid||d.received||0).toFixed(2);
+            document.getElementById('partialShort').textContent = '₹' + (d.short_by||0).toFixed(2);
+            document.getElementById('partialMsg').innerHTML = d.message || 'Payment incomplete.';
             document.getElementById('partialTxn').textContent = d.txn_id || '-';
             document.getElementById('partialOverlay').classList.add('show');
-            partialShown = true;
-            // QR stays active — timer keeps running
+            // Re-show QR after 6 sec
+            setTimeout(()=>{document.getElementById('partialOverlay').classList.remove('show'); partialShown = false;}, 6000);
         }
         else if(d.status==='EXPIRED'){
             S.textContent='❌ QR Expired'; S.className='status expired';
@@ -1245,620 +1474,29 @@ async function poll(){
         }
     }catch(e){}
 }
-function copyText(t){
-    navigator.clipboard.writeText(t).then(()=>{
-        const toast = document.createElement('div');
-        toast.textContent='✅ Copied!';
-        toast.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00e0a4;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999;box-shadow:0 0 30px rgba(0,224,164,.6)';
-        document.body.appendChild(toast);
-        setTimeout(()=>toast.remove(), 2000);
-    });
-}
 tInt=setInterval(tick,1000); pInt=setInterval(poll,1500); poll();
 </script></body></html>
 """
 
-# ==========================================
-# INTEGRATION TELEGRAM PAGE (V5 NEW)
-# ==========================================
-INTEGRATION_TELEGRAM_HTML = r"""
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Telegram Bot Integration</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif}
-body{background:#05050a;color:#e8e8f5;padding:20px;min-height:100vh}
-.container{max-width:900px;margin:0 auto}
-h1{font-size:28px;font-weight:900;margin-bottom:8px;
-background:linear-gradient(90deg,#00ffb3,#a855f7,#ff00aa);background-size:200%;
--webkit-background-clip:text;color:transparent;animation:rbow 4s linear infinite}
-@keyframes rbow{to{background-position:200% 0}}
-.sub{color:#7a7a9a;font-size:13px;margin-bottom:24px}
-.card{background:rgba(15,15,30,.85);border:1px solid #1f1f3a;border-radius:16px;padding:22px;margin-bottom:16px}
-.card h2{font-size:15px;font-weight:800;margin-bottom:14px;color:#00ffb3;
-text-shadow:0 0 20px rgba(0,255,179,.3);display:flex;align-items:center;gap:8px}
-.card h3{font-size:13px;font-weight:700;margin:16px 0 8px;color:#00d4ff}
-.api-box{background:#02020a;border:1px dashed rgba(0,255,179,.4);padding:14px;
-border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;font-size:12px;
-word-break:break-all;display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
-.copy{background:rgba(0,255,179,.15);color:#00ffb3;border:1px solid rgba(0,255,179,.3);
-padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0;transition:.2s}
-.copy:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
-pre{background:#02020a;border:1px solid rgba(0,255,179,.2);padding:16px;border-radius:10px;
-font-size:11px;overflow-x:auto;color:#00ffb3;line-height:1.6;font-family:'Space Mono',monospace;
-margin:12px 0}
-.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
-.tab{padding:8px 14px;background:rgba(21,21,42,.8);border:1px solid #1f1f3a;
-border-radius:8px;font-size:12px;font-weight:700;color:#7a7a9a;cursor:pointer;transition:.2s}
-.tab:hover{border-color:#00ffb3}
-.tab.active{background:linear-gradient(90deg,#00ffb3,#00d4ff);color:#05050a;border-color:#00ffb3}
-.hidden{display:none!important}
-.badge{display:inline-block;background:rgba(0,255,179,.15);color:#00ffb3;
-padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;text-transform:uppercase;margin-left:8px}
-</style></head><body>
-<div class="container">
-<h1>🤖 Telegram Bot Integration</h1>
-<p class="sub">Use your API key with any Telegram bot (Python/Node.js/PHP)</p>
+@app.route('/')
+def home(): return render_template_string(MAIN_HTML)
 
-<div class="card">
-<h2>📌 Your Credentials</h2>
-<div class="api-box"><span>API_KEY: {{ api_key }}</span><button class="copy" onclick="copyText('{{ api_key }}')">Copy</button></div>
-<div class="api-box"><span>BASE_URL: {{ base }}</span><button class="copy" onclick="copyText('{{ base }}')">Copy</button></div>
-<div class="api-box"><span>QR URL: {{ qr_url }}</span><button class="copy" onclick="copyText('{{ qr_url }}')">Copy</button></div>
-<div class="api-box"><span>CHECK URL: {{ check_url }}</span><button class="copy" onclick="copyText('{{ check_url }}')">Copy</button></div>
-</div>
-
-<div class="card">
-<h2>🐍 Python Bot <span class="badge">Recommended</span></h2>
-<div class="tabs">
-<div class="tab active" onclick="switchTab('py1',this)">python-telegram-bot</div>
-<div class="tab" onclick="switchTab('py2',this)">pyTelegramBotAPI</div>
-</div>
-<pre id="py1">import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-API_KEY = "{{ api_key }}"
-BASE = "{{ base }}"
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "Commands:\n"
-        "/qr AMOUNT — Generate payment QR\n"
-        "/check ORDER_ID — Check payment status"
-    )
-
-async def qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Usage: /qr 100")
-    amount = ctx.args[0]
-    order_url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
-    await update.message.reply_text(
-        f"💳 *Pay ₹{amount}*\n\n"
-        f"Click to pay: [Open QR Page]({order_url})\n\n"
-        f"After payment, use /check to verify.",
-        parse_mode="Markdown",
-        disable_web_page_preview=False
-    )
-
-async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Usage: /check ORDER_ID")
-    order_id = ctx.args[0]
-    r = requests.get(f"{BASE}/api/v2/check/{API_KEY}?order_id={order_id}").json()
-
-    if r.get('status') == 'PAID':
-        await update.message.reply_text(
-            f"✅ *Payment Confirmed!*\n\n"
-            f"💰 Amount: ₹{r['amount']}\n"
-            f"🆔 Txn ID: `{r['txn_id']}`\n"
-            f"🔖 UTR: {r.get('utr', '-')}\n"
-            f"👤 From: {r.get('sender_name', '-')}\n"
-            f"📱 UPI: {r.get('sender_upi', '-')}",
-            parse_mode="Markdown"
-        )
-    elif r.get('status') == 'PARTIAL':
-        await update.message.reply_text(
-            f"⚠️ *Partial Payment*\n\n"
-            f"Expected: ₹{r['expected']}\n"
-            f"Received: ₹{r['received']}\n"
-            f"Short: ₹{r.get('short_by', 0)}\n\n"
-            f"{r.get('message', '')}",
-            parse_mode="Markdown"
-        )
-    elif r.get('status') == 'EXPIRED':
-        await update.message.reply_text("❌ QR expired. Generate a new one with /qr AMOUNT")
-    else:
-        await update.message.reply_text(f"⏳ Status: {r.get('status', 'PENDING')}")
-
-app = Application.builder().token("YOUR_BOT_TOKEN").build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("qr", qr))
-app.add_handler(CommandHandler("check", check))
-app.run_polling()</pre>
-<pre id="py2" class="hidden">import telebot
-import requests
-
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-API_KEY = "{{ api_key }}"
-BASE = "{{ base }}"
-
-bot = telebot.TeleBot(BOT_TOKEN)
-
-@bot.message_handler(commands=['start'])
-def start(msg):
-    bot.reply_to(msg,
-        "👋 Welcome!\n\n"
-        "/qr AMOUNT — Generate QR\n"
-        "/check ORDER_ID — Check status"
-    )
-
-@bot.message_handler(commands=['qr'])
-def qr(msg):
-    parts = msg.text.split()
-    if len(parts) < 2:
-        return bot.reply_to(msg, "Usage: /qr 100")
-    amount = parts[1]
-    url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
-    bot.reply_to(msg, f"💳 Pay ₹{amount}:\n{url}")
-
-@bot.message_handler(commands=['check'])
-def check(msg):
-    parts = msg.text.split()
-    if len(parts) < 2:
-        return bot.reply_to(msg, "Usage: /check ORDER_ID")
-    order_id = parts[1]
-    r = requests.get(f"{BASE}/api/v2/check/{API_KEY}?order_id={order_id}").json()
-    if r.get('status') == 'PAID':
-        bot.reply_to(msg, f"✅ Paid ₹{r['amount']}\nTxn: {r['txn_id']}\nUTR: {r.get('utr','-')}")
-    elif r.get('status') == 'PARTIAL':
-        bot.reply_to(msg, f"⚠️ Short by ₹{r.get('short_by',0)}\n{r.get('message','')}")
-    else:
-        bot.reply_to(msg, f"Status: {r.get('status')}")
-
-bot.infinity_polling()</pre>
-</div>
-
-<div class="card">
-<h2>📦 Node.js Bot</h2>
-<div class="tabs">
-<div class="tab active" onclick="switchTab('js1',this)">node-telegram-bot-api</div>
-<div class="tab" onclick="switchTab('js2',this)">Telegraf</div>
-</div>
-<pre id="js1">const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-
-const BOT_TOKEN = 'YOUR_BOT_TOKEN';
-const API_KEY = '{{ api_key }}';
-const BASE = '{{ base }}';
-
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    '👋 Welcome!\n\n/qr AMOUNT\n/check ORDER_ID'
-  );
-});
-
-bot.onText(/\/qr (.+)/, (msg, match) => {
-  const amount = match[1];
-  const url = `${BASE}/v2/fam/${API_KEY}?qr=${amount}`;
-  bot.sendMessage(msg.chat.id, `💳 Pay ₹${amount}:\n${url}`);
-});
-
-bot.onText(/\/check (.+)/, async (msg, match) => {
-  const orderId = match[1];
-  try {
-    const { data } = await axios.get(`${BASE}/api/v2/check/${API_KEY}?order_id=${orderId}`);
-    if (data.status === 'PAID') {
-      bot.sendMessage(msg.chat.id,
-        `✅ Payment Confirmed!\n\n` +
-        `💰 ₹${data.amount}\n` +
-        `🆔 ${data.txn_id}\n` +
-        `🔖 UTR: ${data.utr || '-'}\n` +
-        `👤 ${data.sender_name || '-'}`
-      );
-    } else if (data.status === 'PARTIAL') {
-      bot.sendMessage(msg.chat.id,
-        `⚠️ Partial Payment\n` +
-        `Expected: ₹${data.expected}\n` +
-        `Received: ₹${data.received}\n` +
-        `Short: ₹${data.short_by}\n\n${data.message}`
-      );
-    } else {
-      bot.sendMessage(msg.chat.id, `Status: ${data.status}`);
-    }
-  } catch(e) { bot.sendMessage(msg.chat.id, '❌ Error'); }
-});</pre>
-<pre id="js2" class="hidden">const { Telegraf } = require('telegraf');
-const axios = require('axios');
-
-const bot = new Telegraf('YOUR_BOT_TOKEN');
-const API_KEY = '{{ api_key }}';
-const BASE = '{{ base }}';
-
-bot.start((ctx) => ctx.reply('👋 Welcome!\n/qr AMOUNT\n/check ORDER_ID'));
-
-bot.command('qr', (ctx) => {
-  const amount = ctx.message.text.split(' ')[1];
-  if (!amount) return ctx.reply('Usage: /qr 100');
-  const url = `${BASE}/v2/fam/${API_KEY}?qr=${amount}`;
-  ctx.reply(`💳 Pay ₹${amount}:\n${url}`);
-});
-
-bot.command('check', async (ctx) => {
-  const orderId = ctx.message.text.split(' ')[1];
-  if (!orderId) return ctx.reply('Usage: /check ORDER_ID');
-  const { data } = await axios.get(`${BASE}/api/v2/check/${API_KEY}?order_id=${orderId}`);
-  if (data.status === 'PAID') {
-    ctx.reply(`✅ ₹${data.amount} | Txn: ${data.txn_id} | UTR: ${data.utr}`);
-  } else if (data.status === 'PARTIAL') {
-    ctx.reply(`⚠️ Short: ₹${data.short_by}\n${data.message}`);
-  } else {
-    ctx.reply(`Status: ${data.status}`);
-  }
-});
-
-bot.launch();</pre>
-</div>
-
-<div class="card">
-<h2>🐘 PHP Bot</h2>
-<pre>$bot_token = 'YOUR_BOT_TOKEN';
-$api_key = '{{ api_key }}';
-$base = '{{ base }}';
-
-$update = json_decode(file_get_contents('php://input'), true);
-$chat_id = $update['message']['chat']['id'];
-$text = $update['message']['text'] ?? '';
-
-if (strpos($text, '/qr ') === 0) {
-    $amount = explode(' ', $text)[1];
-    $url = "$base/v2/fam/$api_key?qr=$amount";
-    file_get_contents("https://api.telegram.org/bot$bot_token/sendMessage?" . http_build_query([
-        'chat_id' => $chat_id,
-        'text' => "💳 Pay ₹$amount:\n$url"
-    ]));
-}
-
-if (strpos($text, '/check ') === 0) {
-    $order_id = explode(' ', $text)[1];
-    $res = json_decode(file_get_contents("$base/api/v2/check/$api_key?order_id=$order_id"), true);
-    if ($res['status'] === 'PAID') {
-        $msg = "✅ Paid ₹{$res['amount']}\nTxn: {$res['txn_id']}";
-    } elseif ($res['status'] === 'PARTIAL') {
-        $msg = "⚠️ Short by ₹{$res['short_by']}";
-    } else {
-        $msg = "Status: {$res['status']}";
-    }
-    file_get_contents("https://api.telegram.org/bot$bot_token/sendMessage?" . http_build_query([
-        'chat_id' => $chat_id, 'text' => $msg
-    ]));
-}</pre>
-</div>
-
-<div class="card">
-<h2>📋 API Response Format</h2>
-<pre>{
-  "status": "PAID",
-  "order_id": "ORD17300000001234",
-  "amount": 100.0,
-  "expected": 100.0,
-  "txn_id": "FMPIB6930608000",
-  "utr": "667524755400",
-  "sender_name": "mal",
-  "sender_upi": "mal.628@superyes",
-  "email_date": "10:54 AM IST, 05 November 2026",
-  "verified": true
-}</pre>
-<pre>{
-  "status": "PARTIAL",
-  "expected": 100.0,
-  "received": 90.0,
-  "short_by": 10.0,
-  "message": "⚠️ You paid ₹90.00. Please pay remaining ₹10.00 to complete.",
-  "qr_still_active": true
-}</pre>
-</div>
-
-</div>
-<script>
-function copyText(t){navigator.clipboard.writeText(t).then(()=>{
-    const b=document.createElement('div');
-    b.textContent='✅ Copied!';
-    b.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00ffb3;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999';
-    document.body.appendChild(b);setTimeout(()=>b.remove(),2000);
-});}
-function switchTab(id,el){
-    el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    el.classList.add('active');
-    el.parentElement.parentElement.querySelectorAll('pre').forEach(p=>p.classList.add('hidden'));
-    document.getElementById(id).classList.remove('hidden');
-}
-</script></body></html>
-"""
+@app.route('/health')
+def health(): return jsonify({"status":"ok", "version":APP_VERSION, "time": time.time()})
 
 # ==========================================
-# INTEGRATION WEBSITE PAGE (V5 NEW)
-# ==========================================
-INTEGRATION_WEBSITE_HTML = r"""
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Website Integration</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif}
-body{background:#05050a;color:#e8e8f5;padding:20px;min-height:100vh}
-.container{max-width:900px;margin:0 auto}
-h1{font-size:28px;font-weight:900;margin-bottom:8px;
-background:linear-gradient(90deg,#00ffb3,#a855f7,#ff00aa);background-size:200%;
--webkit-background-clip:text;color:transparent;animation:rbow 4s linear infinite}
-@keyframes rbow{to{background-position:200% 0}}
-.sub{color:#7a7a9a;font-size:13px;margin-bottom:24px}
-.card{background:rgba(15,15,30,.85);border:1px solid #1f1f3a;border-radius:16px;padding:22px;margin-bottom:16px}
-.card h2{font-size:15px;font-weight:800;margin-bottom:14px;color:#00ffb3;
-text-shadow:0 0 20px rgba(0,255,179,.3)}
-.api-box{background:#02020a;border:1px dashed rgba(0,255,179,.4);padding:14px;
-border-radius:10px;color:#00ffb3;font-family:'Space Mono',monospace;font-size:12px;
-word-break:break-all;display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px}
-.copy{background:rgba(0,255,179,.15);color:#00ffb3;border:1px solid rgba(0,255,179,.3);
-padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0;transition:.2s}
-.copy:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
-pre{background:#02020a;border:1px solid rgba(0,255,179,.2);padding:16px;border-radius:10px;
-font-size:11px;overflow-x:auto;color:#00ffb3;line-height:1.6;font-family:'Space Mono',monospace;
-margin:12px 0}
-.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
-.tab{padding:8px 14px;background:rgba(21,21,42,.8);border:1px solid #1f1f3a;
-border-radius:8px;font-size:12px;font-weight:700;color:#7a7a9a;cursor:pointer;transition:.2s}
-.tab:hover{border-color:#00ffb3}
-.tab.active{background:linear-gradient(90deg,#00ffb3,#00d4ff);color:#05050a;border-color:#00ffb3}
-.hidden{display:none!important}
-</style></head><body>
-<div class="container">
-<h1>🌐 Website / App Integration</h1>
-<p class="sub">Embed QR page on any website — HTML, PHP, React, Vue, Node.js all supported</p>
-
-<div class="card">
-<h2>📌 Your Credentials</h2>
-<div class="api-box"><span>API_KEY: {{ api_key }}</span><button class="copy" onclick="copyText('{{ api_key }}')">Copy</button></div>
-<div class="api-box"><span>BASE_URL: {{ base }}</span><button class="copy" onclick="copyText('{{ base }}')">Copy</button></div>
-<div class="api-box"><span>QR URL: {{ qr_url }}</span><button class="copy" onclick="copyText('{{ qr_url }}')">Copy</button></div>
-</div>
-
-<div class="card">
-<h2>📄 Method 1: Direct Link (Simplest)</h2>
-<pre>&lt;a href="{{ base }}/v2/fam/{{ api_key }}?qr=100" target="_blank"&gt;
-  💳 Pay ₹100
-&lt;/a&gt;</pre>
-</div>
-
-<div class="card">
-<h2>🖼️ Method 2: Iframe Embed</h2>
-<pre>&lt;iframe
-  src="{{ base }}/v2/fam/{{ api_key }}?qr=100"
-  width="460"
-  height="850"
-  frameborder="0"
-  style="border-radius:20px;box-shadow:0 0 40px rgba(0,255,179,.3)"
-&gt;&lt;/iframe&gt;</pre>
-</div>
-
-<div class="card">
-<h2>⚡ Method 3: JavaScript with Auto-Check</h2>
-<div class="tabs">
-<div class="tab active" onclick="switchTab('js1',this)">Vanilla JS</div>
-<div class="tab" onclick="switchTab('js2',this)">React</div>
-<div class="tab" onclick="switchTab('js3',this)">Vue</div>
-</div>
-<pre id="js1">&lt;!DOCTYPE html&gt;
-&lt;html&gt;
-&lt;head&gt;&lt;title&gt;Pay ₹100&lt;/title&gt;&lt;/head&gt;
-&lt;body&gt;
-  &lt;h2&gt;Pay ₹100&lt;/h2&gt;
-  &lt;iframe src="{{ base }}/v2/fam/{{ api_key }}?qr=100"
-          width="460" height="850" frameborder="0"
-          style="border-radius:20px"&gt;&lt;/iframe&gt;
-
-  &lt;script&gt;
-  // Get order_id from URL after iframe loads, or use latest
-  const API_KEY = '{{ api_key }}';
-  const BASE = '{{ base }}';
-
-  async function checkPayment() {
-    const r = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
-    const data = await r.json();
-    if (data.status === 'PAID') {
-      alert(`✅ Payment received: ₹${data.amount}\nTxn: ${data.txn_id}`);
-      // Redirect, show message, etc.
-    } else if (data.status === 'PARTIAL') {
-      console.log(`⚠️ Short by ₹${data.short_by}`);
-    }
-    return data;
-  }
-
-  setInterval(checkPayment, 2000);
-  &lt;/script&gt;
-&lt;/body&gt;
-&lt;/html&gt;</pre>
-
-<pre id="js2" class="hidden">import { useEffect, useState } from 'react';
-
-function PaymentPage() {
-  const [status, setStatus] = useState('PENDING');
-  const [orderData, setOrderData] = useState(null);
-
-  const API_KEY = '{{ api_key }}';
-  const BASE = '{{ base }}';
-
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      const res = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
-      const data = await res.json();
-      if (data.status === 'PAID') {
-        setStatus('PAID');
-        setOrderData(data);
-        clearInterval(interval);
-      } else if (data.status === 'PARTIAL') {
-        setStatus('PARTIAL');
-        setOrderData(data);
-      }
-    }, 2000);
-    return () => clearInterval(interval);
-  }, []);
-
-  return (
-    &lt;div&gt;
-      &lt;h2&gt;Pay ₹100&lt;/h2&gt;
-      {status === 'PAID' && (
-        &lt;div&gt;✅ Paid ₹{orderData.amount} — Txn {orderData.txn_id}&lt;/div&gt;
-      )}
-      {status === 'PARTIAL' && (
-        &lt;div&gt;⚠️ Short by ₹{orderData.short_by}&lt;/div&gt;
-      )}
-      &lt;iframe
-        src={`${BASE}/v2/fam/${API_KEY}?qr=100`}
-        width="460" height="850" frameBorder="0"
-      /&gt;
-    &lt;/div&gt;
-  );
-}</pre>
-
-<pre id="js3" class="hidden">&lt;template&gt;
-  &lt;div&gt;
-    &lt;h2&gt;Pay ₹100&lt;/h2&gt;
-    &lt;div v-if="status === 'PAID'"&gt;✅ Paid ₹{{ orderData.amount }}&lt;/div&gt;
-    &lt;div v-if="status === 'PARTIAL'"&gt;⚠️ Short by ₹{{ orderData.short_by }}&lt;/div&gt;
-    &lt;iframe :src="qrUrl" width="460" height="850" /&gt;
-  &lt;/div&gt;
-&lt;/template&gt;
-
-&lt;script setup&gt;
-import { ref, onMounted, onUnmounted } from 'vue';
-
-const API_KEY = '{{ api_key }}';
-const BASE = '{{ base }}';
-const qrUrl = `${BASE}/v2/fam/${API_KEY}?qr=100`;
-const status = ref('PENDING');
-const orderData = ref(null);
-let interval;
-
-onMounted(() => {
-  interval = setInterval(async () => {
-    const res = await fetch(`${BASE}/api/v2/check/${API_KEY}`);
-    const data = await res.json();
-    if (data.status === 'PAID') {
-      status.value = 'PAID';
-      orderData.value = data;
-      clearInterval(interval);
-    } else if (data.status === 'PARTIAL') {
-      status.value = 'PARTIAL';
-      orderData.value = data;
-    }
-  }, 2000);
-});
-
-onUnmounted(() => clearInterval(interval));
-&lt;/script&gt;</pre>
-</div>
-
-<div class="card">
-<h2>🐘 PHP Integration</h2>
-<pre>&lt;?php
-$api_key = '{{ api_key }}';
-$base = '{{ base }}';
-$amount = 100;
-
-// Generate QR page URL
-$qr_url = "$base/v2/fam/$api_key?qr=$amount";
-?&gt;
-
-&lt;!DOCTYPE html&gt;
-&lt;html&gt;
-&lt;body&gt;
-  &lt;h2&gt;Pay ₹&lt;?= $amount ?&gt;&lt;/h2&gt;
-  &lt;iframe src="&lt;?= $qr_url ?&gt;" width="460" height="850"&gt;&lt;/iframe&gt;
-&lt;/body&gt;
-&lt;/html&gt;</pre>
-</div>
-
-<div class="card">
-<h2>🟢 Node.js / Express</h2>
-<pre>const express = require('express');
-const axios = require('axios');
-const app = express();
-
-const API_KEY = '{{ api_key }}';
-const BASE = '{{ base }}';
-
-app.get('/pay', async (req, res) => {
-  const amount = req.query.amount || 100;
-  res.send(`
-    &lt;h2&gt;Pay ₹${amount}&lt;/h2&gt;
-    &lt;iframe src="${BASE}/v2/fam/${API_KEY}?qr=${amount}"
-            width="460" height="850"&gt;&lt;/iframe&gt;
-    &lt;script&gt;
-    setInterval(async () => {
-      const r = await fetch('/check');
-      const d = await r.json();
-      if (d.status === 'PAID') alert('Paid: ₹' + d.amount);
-    }, 2000);
-    &lt;/script&gt;
-  `);
-});
-
-app.get('/check', async (req, res) => {
-  const r = await axios.get(`${BASE}/api/v2/check/${API_KEY}`);
-  res.json(r.data);
-});
-
-app.listen(3000);</pre>
-</div>
-
-<div class="card">
-<h2>📋 API Response Format</h2>
-<pre>{
-  "status": "PAID",
-  "amount": 100.0,
-  "txn_id": "FMPIB6930608000",
-  "utr": "667524755400",
-  "sender_name": "mal",
-  "sender_upi": "mal.628@superyes",
-  "email_date": "10:54 AM IST, 05 November 2026",
-  "verified": true
-}</pre>
-</div>
-
-</div>
-<script>
-function copyText(t){navigator.clipboard.writeText(t).then(()=>{
-    const b=document.createElement('div');
-    b.textContent='✅ Copied!';
-    b.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#00ffb3;color:#05050a;padding:12px 24px;border-radius:10px;font-weight:800;z-index:9999';
-    document.body.appendChild(b);setTimeout(()=>b.remove(),2000);
-});}
-function switchTab(id,el){
-    el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    el.classList.add('active');
-    el.parentElement.parentElement.querySelectorAll('pre').forEach(p=>p.classList.add('hidden'));
-    document.getElementById(id).classList.remove('hidden');
-}
-</script></body></html>
-"""
-
-# ==========================================
-# MAIN DASHBOARD V5
+# MAIN DASHBOARD (abbreviated - keep existing from V4 but add Telegram/Website links)
 # ==========================================
 MAIN_HTML = r"""
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FamPay AutoQR V5.0 ULTRA PRO</title>
+<title>FamPay AutoQR V5.0 ULTRA</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#05050a;--surface:#0f0f1e;--surface2:#15152a;--border:#1f1f3a;--text:#e8e8f5;--dim:#7a7a9a;
---ng:#00ffb3;--nc:#00d4ff;--np:#a855f7;--npink:#ff00aa;--nwarn:#ffa502;--dang:#ff4757;--ok:#00e0a4;
---shadow:0 0 60px rgba(0,255,179,.2)}
-[data-theme="light"]{--bg:#f5f7fa;--surface:#ffffff;--surface2:#f0f2f7;--border:#e0e4ec;--text:#0f0f1e;--dim:#6a6a8a;--shadow:0 0 40px rgba(168,85,247,.1)}
+--ng:#00ffb3;--nc:#00d4ff;--np:#a855f7;--npink:#ff00aa;--nwarn:#ffa502;--dang:#ff4757;--ok:#00e0a4;}
+[data-theme="light"]{--bg:#f5f7fa;--surface:#ffffff;--surface2:#f0f2f7;--border:#e0e4ec;--text:#0f0f1e;--dim:#6a6a8a}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;transition:.3s}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;background:
@@ -1871,8 +1509,8 @@ button,input,select,textarea{font-family:inherit;outline:none}
 .hidden{display:none!important}
 .auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
 .auth-card{width:100%;max-width:420px;background:rgba(15,15,30,.85);backdrop-filter:blur(20px);
-border:1px solid rgba(0,255,179,.2);border-radius:24px;padding:34px 28px;box-shadow:var(--shadow);
-position:relative;overflow:hidden;animation:cardIn .6s cubic-bezier(.175,.885,.32,1.275)}
+border:1px solid rgba(0,255,179,.2);border-radius:24px;padding:34px 28px;
+box-shadow:0 0 60px rgba(0,255,179,.2);position:relative;overflow:hidden;animation:cardIn .6s}
 @keyframes cardIn{0%{transform:scale(.9);opacity:0}100%{transform:scale(1);opacity:1}}
 .logo{font-size:22px;font-weight:900;text-align:center;margin-bottom:4px;
 background:linear-gradient(90deg,var(--ng),var(--np),var(--npink),var(--nc));background-size:300% 100%;
@@ -1884,17 +1522,12 @@ filter:drop-shadow(0 0 10px rgba(0,255,179,.4))}
 .field label{display:block;font-size:11px;font-weight:700;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
 .field input{width:100%;padding:12px 14px;background:var(--surface2);border:1px solid var(--border);
 border-radius:10px;color:var(--text);font-size:14px;transition:.2s}
-.field input:focus{border-color:var(--ng);box-shadow:0 0 0 3px rgba(0,255,179,.15),0 0 20px rgba(0,255,179,.3)}
+.field input:focus{border-color:var(--ng);box-shadow:0 0 0 3px rgba(0,255,179,.15)}
 .btn{width:100%;padding:13px;border:none;border-radius:10px;font-weight:800;font-size:14px;
 background:linear-gradient(90deg,var(--ng),var(--nc),var(--np));color:#05050a;
-transition:.2s;cursor:pointer;background-size:200% 100%;display:flex;align-items:center;justify-content:center;gap:8px;
-position:relative;overflow:hidden}
-.btn::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
-background:linear-gradient(90deg,transparent,rgba(255,255,255,.4),transparent);transition:.5s}
-.btn:hover::before{left:100%}
-.btn:hover{transform:translateY(-2px);box-shadow:0 0 30px rgba(0,255,179,.6),0 0 60px rgba(168,85,247,.4);background-position:100% 0}
+transition:.2s;cursor:pointer;background-size:200% 100%;position:relative;overflow:hidden}
+.btn:hover{transform:translateY(-2px);box-shadow:0 0 30px rgba(0,255,179,.6);background-position:100% 0}
 .btn.sec{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
-.btn.sec:hover{box-shadow:0 0 20px rgba(0,255,179,.3);border-color:var(--ng)}
 .btn.dang{background:linear-gradient(90deg,var(--dang),var(--npink))}
 .switch{text-align:center;margin-top:14px;font-size:13px;color:var(--dim)}
 .switch a{color:var(--ng);font-weight:700;cursor:pointer}
@@ -1903,14 +1536,13 @@ background:linear-gradient(90deg,transparent,rgba(255,255,255,.4),transparent);t
 border-right:1px solid var(--border);padding:22px 14px;position:fixed;inset:0 auto 0 0;overflow-y:auto;z-index:50;transition:transform .3s}
 .brand{font-size:17px;font-weight:900;padding:0 8px 20px;
 background:linear-gradient(90deg,var(--ng),var(--np),var(--npink));background-size:200%;
--webkit-background-clip:text;color:transparent;animation:rbow 3s infinite linear;
-filter:drop-shadow(0 0 8px rgba(0,255,179,.3))}
+-webkit-background-clip:text;color:transparent;animation:rbow 3s infinite linear}
 .nav{display:flex;flex-direction:column;gap:3px}
 .item{padding:11px 14px;border-radius:10px;color:var(--dim);font-size:13px;font-weight:600;
-display:flex;align-items:center;gap:10px;cursor:pointer;transition:.15s;position:relative}
+display:flex;align-items:center;gap:10px;cursor:pointer;transition:.15s}
 .item:hover{background:var(--surface2);color:var(--text);transform:translateX(3px)}
 .item.active{background:linear-gradient(90deg,rgba(0,255,179,.18),rgba(168,85,247,.08));
-color:var(--ng);box-shadow:inset 0 0 20px rgba(0,255,179,.15),0 0 15px rgba(0,255,179,.2)}
+color:var(--ng);box-shadow:inset 0 0 20px rgba(0,255,179,.15)}
 .sec-lbl{font-size:10px;font-weight:800;color:#3a3a5a;text-transform:uppercase;letter-spacing:1.5px;padding:16px 14px 6px}
 .main{flex:1;margin-left:260px;padding:24px;max-width:100%}
 @media(max-width:860px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:none}.main{margin-left:0;padding:14px}}
@@ -1941,34 +1573,19 @@ border-radius:16px;padding:22px;margin-bottom:16px;transition:.3s}
 @media(max-width:500px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}}
 .hero{background:linear-gradient(135deg,rgba(0,255,179,.18),rgba(168,85,247,.18),rgba(255,0,170,.12));
 border:1px solid rgba(0,255,179,.4);border-radius:20px;padding:28px;position:relative;overflow:hidden;
-box-shadow:0 0 60px rgba(0,255,179,.2),0 0 120px rgba(168,85,247,.1)}
-.hero::before{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
-background:conic-gradient(from 0deg,transparent,rgba(0,255,179,.15),transparent 30%);
-animation:rotateGlow 10s linear infinite;z-index:0}
-@keyframes rotateGlow{to{transform:rotate(360deg)}}
-.hero > *{position:relative;z-index:1}
+box-shadow:0 0 60px rgba(0,255,179,.2)}
 .hero-amt{font-size:52px;font-weight:900;margin:8px 0;
 background:linear-gradient(90deg,var(--ng),var(--np),var(--npink));background-size:200% 100%;
 -webkit-background-clip:text;color:transparent;filter:drop-shadow(0 0 20px rgba(255,0,170,.5));
 animation:rbow 4s linear infinite}
 .hero-lbl{font-size:11px;font-weight:800;color:var(--dim);text-transform:uppercase;letter-spacing:2px}
 .hero-sub{font-size:13px;color:var(--dim)}.hero-sub b{color:var(--text)}
-.stat{background:rgba(21,21,42,.7);backdrop-filter:blur(10px);border:1px solid var(--border);
-border-radius:14px;padding:16px;position:relative;overflow:hidden;transition:.3s}
+.stat{background:rgba(21,21,42,.7);border:1px solid var(--border);border-radius:14px;padding:16px;transition:.3s}
 .stat:hover{transform:translateY(-3px);border-color:var(--ng);box-shadow:0 0 25px rgba(0,255,179,.3)}
-.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-background:linear-gradient(90deg,var(--ng),var(--nc));box-shadow:0 0 10px var(--ng)}
 .stat-lbl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;font-weight:700}
 .stat-val{font-size:24px;font-weight:800;margin-top:4px;color:var(--ng);text-shadow:0 0 15px rgba(0,255,179,.4)}
-.stat.alt .stat-val{color:var(--np);text-shadow:0 0 15px rgba(168,85,247,.4)}
-.stat.alt2 .stat-val{color:var(--npink);text-shadow:0 0 15px rgba(255,0,170,.4)}
-.stat.warn .stat-val{color:var(--nwarn);text-shadow:0 0 15px rgba(255,165,2,.4)}
-.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
-.tab{padding:8px 14px;background:var(--surface2);border:1px solid var(--border);
-border-radius:8px;font-size:12px;font-weight:600;color:var(--dim);cursor:pointer;transition:.2s}
-.tab:hover{border-color:var(--ng)}
-.tab.active{background:linear-gradient(90deg,var(--ng),var(--nc));color:#05050a;border-color:var(--ng);
-box-shadow:0 0 20px rgba(0,255,179,.5)}
+.stat.alt .stat-val{color:var(--np)}.stat.alt2 .stat-val{color:var(--npink)}
+.stat.warn .stat-val{color:var(--nwarn)}
 .chart-box{position:relative;height:260px;margin-top:8px}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 @media(max-width:600px){.form-grid{grid-template-columns:1fr}}
@@ -1976,67 +1593,58 @@ box-shadow:0 0 20px rgba(0,255,179,.5)}
 .fg label{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
 .fg input,.fg select,.fg textarea{padding:11px 14px;background:var(--surface2);
 border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;transition:.2s}
-.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--ng);
-box-shadow:0 0 0 3px rgba(0,255,179,.15),0 0 20px rgba(0,255,179,.3)}
+.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--ng);box-shadow:0 0 0 3px rgba(0,255,179,.15)}
 .fg small{font-size:10px;color:var(--dim);margin-top:-2px}
 .api-out{background:rgba(2,2,10,.8);border:1px dashed rgba(0,255,179,.5);padding:12px;
 border-radius:10px;color:var(--ng);font-family:'Space Mono',monospace;font-size:11px;
-word-break:break-all;margin-top:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;
-box-shadow:inset 0 0 20px rgba(0,255,179,.1)}
+word-break:break-all;margin-top:8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .copy{background:var(--surface2);border:1px solid var(--border);color:var(--text);
 padding:5px 9px;border-radius:6px;font-size:10px;font-weight:700;flex-shrink:0;cursor:pointer;transition:.2s}
-.copy:hover{background:var(--ng);color:#05050a;border-color:var(--ng);box-shadow:0 0 15px rgba(0,255,179,.5)}
+.copy:hover{background:var(--ng);color:#05050a;border-color:var(--ng)}
 .txn{display:flex;justify-content:space-between;align-items:flex-start;padding:14px;
 background:rgba(21,21,42,.7);border-radius:10px;margin-bottom:8px;font-size:13px;
-border-left:3px solid var(--ok);transition:.2s}
-.txn:hover{background:rgba(21,21,42,.95);box-shadow:0 0 20px rgba(0,224,164,.15)}
+border-left:3px solid var(--ok)}
 .txn.partial{border-left-color:var(--nwarn)}
 .txn .amt{color:var(--ok);font-weight:800;font-size:15px}
 .txn.partial .amt{color:var(--nwarn)}
 .txn .meta{font-size:11px;color:var(--dim);margin-top:3px;font-family:'Space Mono',monospace}
-.flist{list-style:none}.flist li{padding:10px 0;border-bottom:1px solid var(--border);
-display:flex;align-items:center;gap:10px;font-size:13px}
-.flist li:last-child{border:none}.flist li::before{content:'✦';color:var(--ng);font-size:14px;
-text-shadow:0 0 8px var(--ng)}
+.txn .sess{font-size:10px;color:var(--np);font-family:'Space Mono',monospace;margin-top:2px;word-break:break-all}
 #toast{position:fixed;bottom:20px;right:20px;padding:14px 20px;border-radius:12px;
-background:rgba(21,21,42,.95);backdrop-filter:blur(10px);color:var(--text);font-size:13px;font-weight:600;
+background:rgba(21,21,42,.95);color:var(--text);font-size:13px;font-weight:600;
 border-left:3px solid var(--ng);box-shadow:0 0 30px rgba(0,255,179,.4);
 transform:translateY(100px);opacity:0;transition:.3s;z-index:1000;max-width:340px}
 #toast.show{transform:translateY(0);opacity:1}
-#toast.err{border-left-color:var(--dang);box-shadow:0 0 30px rgba(255,71,87,.4)}
+#toast.err{border-left-color:var(--dang)}
 .empty{text-align:center;padding:36px 20px;color:var(--dim);font-size:13px}
 .empty-ic{font-size:36px;opacity:.4;margin-bottom:8px}
 .badge{display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;text-transform:uppercase}
-.badge.life{background:rgba(168,85,247,.2);color:var(--np);box-shadow:0 0 10px rgba(168,85,247,.3)}
-.badge.warn{background:rgba(255,165,2,.2);color:var(--nwarn)}
-.badge.ok{background:rgba(0,224,164,.2);color:var(--ok);box-shadow:0 0 10px rgba(0,224,164,.3)}
+.badge.life{background:rgba(168,85,247,.2);color:var(--np)}
+.badge.ok{background:rgba(0,224,164,.2);color:var(--ok)}
 .uptime{font-family:'Space Mono',monospace;font-size:11px;color:var(--dim);padding:6px 12px;
-background:rgba(21,21,42,.8);border-radius:20px;border:1px solid var(--border);
-box-shadow:0 0 15px rgba(0,255,179,.1)}
-.uptime b{color:var(--ng);text-shadow:0 0 8px var(--ng)}
+background:rgba(21,21,42,.8);border-radius:20px;border:1px solid var(--border)}
+.uptime b{color:var(--ng)}
 .period-tab{display:flex;gap:6px;margin-bottom:14px}
-.period-tab .tab{flex:1;text-align:center}
-.integration-pill{display:inline-flex;align-items:center;gap:6px;
-padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700;
-background:rgba(0,255,179,.15);color:var(--ng);border:1px solid rgba(0,255,179,.3);
-cursor:pointer;transition:.2s}
-.integration-pill:hover{background:rgba(0,255,179,.3);box-shadow:0 0 15px rgba(0,255,179,.4)}
+.tab{flex:1;text-align:center;padding:8px 14px;background:var(--surface2);border:1px solid var(--border);
+border-radius:8px;font-size:12px;font-weight:600;color:var(--dim);cursor:pointer;transition:.2s}
+.tab.active{background:linear-gradient(90deg,var(--ng),var(--nc));color:#05050a;border-color:var(--ng);box-shadow:0 0 20px rgba(0,255,179,.5)}
+pre{background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto;margin-top:8px}
+h3{font-size:13px;margin:14px 0 8px;color:var(--ng)}
 </style></head><body>
 
 <div id="authScreen" class="auth-wrap">
   <div class="auth-card">
     <div class="logo">◆ FamPay AutoQR V5.0</div>
-    <div class="logo-sub">ULTRA PRO · Telegram + Website · Partial Payment Fix</div>
+    <div class="logo-sub">Ultra Session Edition · Multi-Payment · Universal Links</div>
     <div id="loginForm">
-      <div class="field"><label>Username</label><input id="lgU" placeholder="admin" autocomplete="username"></div>
-      <div class="field"><label>Password</label><input id="lgP" type="password" placeholder="••••••" autocomplete="current-password"></div>
+      <div class="field"><label>Username</label><input id="lgU" placeholder="admin"></div>
+      <div class="field"><label>Password</label><input id="lgP" type="password"></div>
       <button class="btn" onclick="doLogin()">⚡ Login →</button>
       <div class="switch">New? <a onclick="toggleAuth('reg')">Create account</a></div>
     </div>
     <div id="regForm" class="hidden">
-      <div class="field"><label>Username</label><input id="rgU" placeholder="yourname"></div>
-      <div class="field"><label>Password</label><input id="rgP" type="password" placeholder="min 4 chars"></div>
-      <div class="field"><label>Email (optional)</label><input id="rgE" type="email" placeholder="you@gmail.com"></div>
+      <div class="field"><label>Username</label><input id="rgU"></div>
+      <div class="field"><label>Password</label><input id="rgP" type="password"></div>
+      <div class="field"><label>Email</label><input id="rgE" type="email"></div>
       <button class="btn" onclick="doReg()">Create Account →</button>
       <div class="switch">Have account? <a onclick="toggleAuth('login')">Login</a></div>
     </div>
@@ -2045,7 +1653,7 @@ cursor:pointer;transition:.2s}
 
 <div id="shell" class="shell hidden">
   <aside id="sidebar" class="sidebar">
-    <div class="brand">◆ FamPay AutoQR V5</div>
+    <div class="brand">◆ FamPay V5</div>
     <nav class="nav">
       <div class="item active" data-p="dashboard" onclick="go('dashboard')">📊 Dashboard</div>
       <div class="item" data-p="analytics" onclick="go('analytics')">📈 Analytics</div>
@@ -2057,7 +1665,6 @@ cursor:pointer;transition:.2s}
       <div class="item" data-p="audit" onclick="go('audit')">🔍 Audit Log</div>
       <div class="sec-lbl">Help</div>
       <div class="item" data-p="docs" onclick="go('docs')">📖 API Docs</div>
-      <div class="item" data-p="settings" onclick="go('settings')">⚙️ Settings</div>
     </nav>
     <div style="margin-top:20px"><button class="btn sec" onclick="doLogout()">🚪 Logout</button></div>
   </aside>
@@ -2069,7 +1676,6 @@ cursor:pointer;transition:.2s}
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <div class="uptime" id="uptime">⏱ <b>--</b></div>
-        <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">🌗</button>
         <div class="chip"><span id="emailDot" class="dot unk"></span><span id="chipUser">-</span></div>
       </div>
     </div>
@@ -2094,19 +1700,16 @@ cursor:pointer;transition:.2s}
 
     <section id="p-analytics" class="page hidden">
       <div class="period-tab">
-        <div class="tab active" data-period="today" onclick="setPeriod('today',this)">Today</div>
-        <div class="tab" data-period="week" onclick="setPeriod('week',this)">Week</div>
-        <div class="tab" data-period="month" onclick="setPeriod('month',this)">Month</div>
-        <div class="tab" data-period="year" onclick="setPeriod('year',this)">Year</div>
+        <div class="tab active" onclick="setPeriod('today',this)">Today</div>
+        <div class="tab" onclick="setPeriod('week',this)">Week</div>
+        <div class="tab" onclick="setPeriod('month',this)">Month</div>
+        <div class="tab" onclick="setPeriod('year',this)">Year</div>
       </div>
       <div class="grid-2">
         <div class="stat"><div class="stat-lbl">Amount</div><div class="stat-val" id="anAmount">₹0</div></div>
-        <div class="stat alt"><div class="stat-lbl">Transactions</div><div class="stat-val" id="anCount">0</div></div>
+        <div class="stat alt"><div class="stat-lbl">Count</div><div class="stat-val" id="anCount">0</div></div>
       </div>
-      <div class="card" style="margin-top:16px"><h2>🥧 Pie Distribution</h2><div class="chart-box"><canvas id="pieChart"></canvas></div></div>
-      <div class="card"><h2>📅 Monthly (12 months)</h2><div class="chart-box"><canvas id="monthChart"></canvas></div></div>
-      <div class="card"><h2>📆 Weekday Distribution</h2><div class="chart-box"><canvas id="weekdayChart"></canvas></div></div>
-      <div class="card"><h2>📈 Yearly (5 years)</h2><div class="chart-box"><canvas id="yearChart"></canvas></div></div>
+      <div class="card" style="margin-top:16px"><h2>📅 Monthly</h2><div class="chart-box"><canvas id="monthChart"></canvas></div></div>
     </section>
 
     <section id="p-account" class="page hidden">
@@ -2114,19 +1717,23 @@ cursor:pointer;transition:.2s}
         <h2>👤 Account Details</h2>
         <div class="form-grid">
           <div class="fg"><label>Full Name</label><input id="acName"></div>
-          <div class="fg"><label>UPI ID</label><input id="acUpi" placeholder="name@bank"></div>
+          <div class="fg"><label>UPI ID</label><input id="acUpi"></div>
         </div>
         <div class="form-grid">
           <div class="fg"><label>Mobile</label><input id="acMob"></div>
-          <div class="fg"><label>Gmail</label><input id="acEmail" type="email"></div>
+          <div class="fg"><label>Gmail</label><input id="acEmail"></div>
         </div>
         <div class="form-grid">
-          <div class="fg"><label>Gmail App Password</label><input id="acPass" type="password" placeholder="16 char app password"><small>Leave blank to keep current</small></div>
-          <div class="fg"><label>QR Minutes</label><input id="acMin" type="number" value="15" min="1"></div>
+          <div class="fg"><label>Gmail App Password</label><input id="acPass" type="password" placeholder="Leave blank to keep"></div>
+          <div class="fg"><label>QR Minutes</label><input id="acMin" type="number" value="15"></div>
         </div>
         <div class="form-grid">
-          <div class="fg"><label>Tolerance (₹)</label><input id="acTol" type="number" step="0.01" value="0"><small>0 = strict. 0.5 = allow ₹0.50 less</small></div>
-          <div class="fg"><label>Webhook URL</label><input id="acHook" placeholder="https://yoursite.com/hook"></div>
+          <div class="fg"><label>Tolerance (₹)</label><input id="acTol" type="number" step="0.01" value="0"></div>
+          <div class="fg"><label>Webhook</label><input id="acHook" placeholder="https://..."></div>
+        </div>
+        <div class="form-grid">
+          <div class="fg"><label>📱 Telegram Bot Link</label><input id="acTgLink" placeholder="https://t.me/YourBot"><small>Optional - shown on success page</small></div>
+          <div class="fg"><label>🌐 Website Link</label><input id="acWebLink" placeholder="https://yoursite.com"><small>Optional - shown on success page</small></div>
         </div>
         <div style="display:flex;gap:10px;margin-top:10px">
           <button class="btn" style="flex:1" onclick="saveAccount()">💾 Save</button>
@@ -2140,20 +1747,20 @@ cursor:pointer;transition:.2s}
       <div class="card">
         <h2>🔑 Generate API Key</h2>
         <div class="form-grid">
-          <div class="fg"><label>Label</label><input id="keyLabel" placeholder="e.g. Bot 1"></div>
-          <div class="fg"><label>Expiry Mode</label>
+          <div class="fg"><label>Label</label><input id="keyLabel"></div>
+          <div class="fg"><label>Mode</label>
             <select id="keyMode" onchange="toggleMode()">
               <option value="days">Days</option><option value="lifetime">Lifetime</option>
             </select></div>
         </div>
         <div class="form-grid">
           <div class="fg" id="daysWrap"><label>Days</label><input id="keyDays" type="number" value="30"></div>
-          <div class="fg"><label>Rate Limit (per min)</label><input id="keyRate" type="number" value="60"></div>
+          <div class="fg"><label>Rate Limit</label><input id="keyRate" type="number" value="60"></div>
         </div>
-        <button class="btn" onclick="genKey()">🚀 Generate Key</button>
+        <button class="btn" onclick="genKey()">🚀 Generate</button>
         <div id="keyRes" style="margin-top:12px"></div>
       </div>
-      <div class="card"><h2>📋 Your Keys</h2><div id="keysList"></div></div>
+      <div class="card"><h2>📋 Keys</h2><div id="keysList"></div></div>
     </section>
 
     <section id="p-history" class="page hidden">
@@ -2161,11 +1768,7 @@ cursor:pointer;transition:.2s}
     </section>
 
     <section id="p-partials" class="page hidden">
-      <div class="card">
-        <h2>⚠️ Partial / Over Payments</h2>
-        <p style="font-size:12px;color:var(--dim);margin-bottom:14px">Transactions that did NOT match expected amount. QR stays active — user can pay remaining.</p>
-        <div id="partialList"></div>
-      </div>
+      <div class="card"><h2>⚠️ Partial Payments</h2><div id="partialList"></div></div>
     </section>
 
     <section id="p-audit" class="page hidden">
@@ -2175,109 +1778,109 @@ cursor:pointer;transition:.2s}
     <section id="p-docs" class="page hidden">
       <div class="card">
         <h2>📖 API Documentation V5</h2>
-        <div style="background:rgba(0,255,179,.08);border:1px solid rgba(0,255,179,.3);padding:14px;border-radius:10px;margin-bottom:14px">
-          <div style="color:var(--ng);font-weight:800;margin-bottom:6px">✨ New in V5.0</div>
-          <ul style="font-size:12px;color:var(--dim);padding-left:18px;line-height:1.8">
-            <li>Telegram Bot integration link (auto-generated)</li>
-            <li>Website/App integration link (auto-generated)</li>
-            <li>Partial payment handling — QR stays active</li>
-            <li>Sender name + UPI + email date in response</li>
-            <li>Multi-QR concurrent support</li>
-          </ul>
-        </div>
+        <h3>1. Generate QR</h3>
+        <div class="api-out"><span>GET /v2/fam/YOUR_KEY?qr=100</span></div>
+        <p style="font-size:12px;color:var(--dim);margin-top:6px">Returns HTML with QR + Session ID + Result links</p>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">🔗 Get Your Integration Links</h3>
-        <p style="font-size:12px;color:var(--dim);margin-bottom:8px">Generate an API key → you'll get 2 integration links:</p>
-        <div class="api-out"><span>Telegram: /api/integration/telegram/YOUR_KEY</span></div>
-        <div class="api-out"><span>Website:  /api/integration/website/YOUR_KEY</span></div>
-        <p style="font-size:12px;color:var(--dim);margin-top:8px">Open these links in a browser — you'll get full copy-paste code for Python, Node.js, PHP, HTML, React, Vue.</p>
+        <h3>2. Check Session (NEW)</h3>
+        <div class="api-out"><span>GET /api/v2/check/YOUR_KEY?session_id=SESSION_ID</span></div>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">1. Generate QR</h3>
-        <div class="api-out"><span>GET /v2/fam/YOUR_API_KEY?qr=100</span><button class="copy" onclick="copyText('/v2/fam/YOUR_KEY?qr=100')">Copy</button></div>
+        <h3>3. Result JSON (NEW)</h3>
+        <div class="api-out"><span>GET /result/SESSION_ID?format=json</span></div>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">2. Check Payment</h3>
-        <div class="api-out"><span>GET /api/v2/check/YOUR_API_KEY?order_id=ORD...</span><button class="copy" onclick="copyText('/api/v2/check/YOUR_KEY')">Copy</button></div>
-
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">3. Payment Statuses</h3>
-        <ul class="flist">
-          <li><b>PENDING</b> — waiting for payment</li>
-          <li><b>PAID</b> — verified ✅ (amount matches)</li>
-          <li><b>PARTIAL</b> — paid less/more, QR still active</li>
-          <li><b>EXPIRED</b> — time over</li>
-        </ul>
-
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">4. PAID Response</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">{
-  "status": "PAID",
+        <h3>4. Response Format</h3>
+        <pre>{
+  "session_id": "Jwowbsiajjaj1919199",
   "order_id": "ORD17300000001234",
-  "amount": 100.0,
+  "status": "PAID",
+  "expected": 10.0,
+  "paid": 10.0,
+  "total_paid": 10.0,
+  "short_by": 0,
   "txn_id": "FMPIB6930608000",
   "utr": "667524755400",
   "sender_name": "mal",
   "sender_upi": "mal.628@superyes",
   "email_date": "10:54 AM IST, 05 November 2026",
-  "verified": true
+  "verified": true,
+  "message": "✅ Payment verified!"
 }</pre>
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">5. PARTIAL Response</h3>
-<pre style="background:#02020a;color:#ffa502;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">{
-  "status": "PARTIAL",
-  "expected": 100.0,
-  "received": 90.0,
-  "short_by": 10.0,
-  "message": "⚠️ You paid ₹90.00. Please pay remaining ₹10.00 to complete.",
-  "qr_still_active": true
-}</pre>
+        <h3>5. Telegram Bot (Python)</h3>
+        <pre>import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-        <h3 style="font-size:13px;margin:14px 0 8px;color:var(--ng)">6. Quick Example (Python)</h3>
-<pre style="background:#02020a;color:#00ffb3;padding:14px;border-radius:10px;font-size:11px;overflow-x:auto">import requests
-
-API_KEY = "YOUR_KEY"
+API_KEY = "YOUR_API_KEY"
 BASE = "https://yourdomain.com"
 
-# Generate QR link
-qr_url = f"{BASE}/v2/fam/{API_KEY}?qr=100"
-print(f"Send this to user: {qr_url}")
+async def qr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    amount = ctx.args[0] if ctx.args else "100"
+    url = f"{BASE}/v2/fam/{API_KEY}?qr={amount}"
+    await update.message.reply_text(f"💳 Pay ₹{amount}: {url}")
 
-# Check status
-r = requests.get(f"{BASE}/api/v2/check/{API_KEY}").json()
-if r['status'] == 'PAID':
-    print(f"✅ Received ₹{r['amount']} from {r['sender_name']} ({r['sender_upi']})")
-elif r['status'] == 'PARTIAL':
-    print(f"⚠️ Short by ₹{r['short_by']} — QR still active")</pre>
+async def check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sid = ctx.args[0] if ctx.args else ""
+    r = requests.get(f"{BASE}/result/{sid}?format=json").json()
+    if r.get('status') == 'PAID':
+        await update.message.reply_text(
+            f"✅ Payment Verified!\n"
+            f"Amount: ₹{r['paid']}\n"
+            f"Session: {r['session_id']}\n"
+            f"Txn: {r['txn_id']}\n"
+            f"UTR: {r['utr']}\n"
+            f"Sender: {r.get('sender_upi','')}"
+        )
+    elif r.get('status') == 'PARTIAL':
+        await update.message.reply_text(
+            f"⚠️ Partial Payment\n"
+            f"Paid: ₹{r['total_paid']}\n"
+            f"Short by: ₹{r['short_by']}\n"
+            f"Please pay ₹{r['short_by']} more"
+        )
+    else:
+        await update.message.reply_text(f"Status: {r.get('status')}")
+
+app = Application.builder().token("BOT_TOKEN").build()
+app.add_handler(CommandHandler("qr", qr))
+app.add_handler(CommandHandler("check", check))
+app.run_polling()</pre>
+
+        <h3>6. Telegram Bot (Node.js)</h3>
+        <pre>const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const BOT_TOKEN = 'YOUR_BOT_TOKEN';
+const API_KEY = 'YOUR_API_KEY';
+const BASE = 'https://yourdomain.com';
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+bot.onText(/\/qr (.+)/, async (msg, match) => {
+  const url = `${BASE}/v2/fam/${API_KEY}?qr=${match[1]}`;
+  bot.sendMessage(msg.chat.id, `💳 Pay ₹${match[1]}:\n${url}`);
+});
+
+bot.onText(/\/check (.+)/, async (msg, match) => {
+  const { data } = await axios.get(`${BASE}/result/${match[1]}?format=json`);
+  if (data.status === 'PAID') {
+    bot.sendMessage(msg.chat.id, `✅ Verified! ₹${data.paid}\nSession: ${data.session_id}`);
+  } else {
+    bot.sendMessage(msg.chat.id, `Status: ${data.status}`);
+  }
+});</pre>
+
+        <h3>7. Website (HTML+JS)</h3>
+        <pre>&lt;iframe src="https://yourdomain.com/v2/fam/YOUR_KEY?qr=100"
+        width="460" height="900"&gt;&lt;/iframe&gt;
+
+&lt;script&gt;
+setInterval(async () => {
+  const r = await fetch('/api/v2/check/YOUR_KEY').then(r=>r.json());
+  if (r.status === 'PAID') alert('Paid ₹' + r.paid);
+}, 1500);
+&lt;/script&gt;</pre>
       </div>
     </section>
-
-    <section id="p-settings" class="page hidden">
-      <div class="card">
-        <h2>⚙️ Settings</h2>
-        <div class="fg" style="margin-bottom:12px">
-          <label>Theme</label>
-          <select id="themeSel" onchange="applyTheme(this.value)">
-            <option value="dark">Dark</option><option value="light">Light</option>
-          </select>
-        </div>
-        <button class="btn" onclick="saveSettings()">💾 Save Settings</button>
-      </div>
-      <div class="card">
-        <h2>ℹ️ About V5.0</h2>
-        <ul class="flist">
-          <li>Version: V5.0.0 ULTRA PRO</li>
-          <li>Telegram Bot Integration: ✅ PY/JS/PHP</li>
-          <li>Website Integration: ✅ HTML/React/Vue/Node</li>
-          <li>Partial Payment Fix: ✅ QR stays active</li>
-          <li>Sender Name + UPI Extraction: ✅</li>
-          <li>UTR + Email Date Display: ✅</li>
-          <li>Multi-QR Concurrent: ✅</li>
-          <li>Flash Speed Verification: ~1-2 sec</li>
-          <li>Email Window: 2 min narrow</li>
-          <li>Duplicate Txn Block: ✅</li>
-          <li>Webhook Support: ✅</li>
-          <li>Glow UI + Aurora Background: ✅</li>
-        </ul>
-      </div>
-    </section>
-
   </main>
 </div>
 <div id="toast"></div>
@@ -2287,32 +1890,27 @@ function toast(m,err){const t=document.getElementById('toast');t.textContent=m;t
 function copyText(t){navigator.clipboard.writeText(t).then(()=>toast('✅ Copied'))}
 async function api(p,o={}){const r=await fetch(p,{headers:{'Content-Type':'application/json'},credentials:'same-origin',...o});let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.error||d.message||'Failed');return d;}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function applyTheme(t){document.documentElement.setAttribute('data-theme',t);localStorage.setItem('theme',t);const s=document.getElementById('themeSel');if(s)s.value=t;}
-function toggleTheme(){const c=document.documentElement.getAttribute('data-theme')||'dark';applyTheme(c==='dark'?'light':'dark');}
-applyTheme(localStorage.getItem('theme')||'dark');
 
 function toggleAuth(m){document.getElementById('loginForm').classList.toggle('hidden',m!=='login');document.getElementById('regForm').classList.toggle('hidden',m!=='reg');}
 async function doLogin(){try{const u=document.getElementById('lgU').value.trim(),p=document.getElementById('lgP').value;if(!u||!p)return toast('Fill fields',true);await api('/api/login',{method:'POST',body:JSON.stringify({username:u,password:p})});toast('✅ Logged in');bootApp();}catch(e){toast('❌ '+e.message,true)}}
-async function doReg(){try{const u=document.getElementById('rgU').value.trim(),p=document.getElementById('rgP').value,em=document.getElementById('rgE').value.trim();if(!u||!p)return toast('Fill fields',true);await api('/api/register',{method:'POST',body:JSON.stringify({username:u,password:p,email:em})});toast('✅ Account created. Please login.');toggleAuth('login');document.getElementById('lgU').value=u;}catch(e){toast('❌ '+e.message,true)}}
+async function doReg(){try{const u=document.getElementById('rgU').value.trim(),p=document.getElementById('rgP').value,em=document.getElementById('rgE').value.trim();if(!u||!p)return toast('Fill fields',true);await api('/api/register',{method:'POST',body:JSON.stringify({username:u,password:p,email:em})});toast('✅ Created');toggleAuth('login');}catch(e){toast('❌ '+e.message,true)}}
 async function doLogout(){if(!confirm('Logout?'))return;await api('/api/logout',{method:'POST'});location.reload();}
 
 function go(p){
   document.querySelectorAll('.page').forEach(x=>x.classList.add('hidden'));
   document.getElementById('p-'+p).classList.remove('hidden');
   document.querySelectorAll('.item').forEach(i=>i.classList.toggle('active',i.dataset.p===p));
-  const titles={dashboard:'Dashboard',analytics:'Analytics',account:'Account',keys:'API Keys',history:'Transactions',partials:'Partial Payments',audit:'Audit Log',docs:'API Docs',settings:'Settings'};
+  const titles={dashboard:'Dashboard',analytics:'Analytics',account:'Account',keys:'API Keys',history:'Transactions',partials:'Partial',audit:'Audit',docs:'API Docs'};
   document.getElementById('title').textContent=titles[p]||p;
   document.getElementById('sidebar').classList.remove('open');
   if(p==='keys')loadKeys();
   if(p==='history')loadHistory();
   if(p==='partials')loadPartials();
   if(p==='audit')loadAudit();
-  if(p==='settings')loadSettings();
   if(p==='analytics')loadAnalytics();
 }
 
-let chart7Obj=null, pieObj=null, monthObj=null, yearObj=null, weekdayObj=null;
-let currentPeriod='today';
+let chart7Obj=null, monthObj=null, currentPeriod='today';
 
 async function bootApp(){
   try{
@@ -2320,11 +1918,9 @@ async function bootApp(){
     document.getElementById('authScreen').classList.add('hidden');
     document.getElementById('shell').classList.remove('hidden');
     document.getElementById('chipUser').textContent=me.username;
-    const dot=document.getElementById('emailDot');
-    dot.className='dot '+(me.email_status==='online'?'on':me.email_status==='offline'?'off':'unk');
+    document.getElementById('emailDot').className='dot '+(me.email_status==='online'?'on':me.email_status==='offline'?'off':'unk');
     fillAccount(me); loadDashboard(); loadUptime();
-    if(me.theme) applyTheme(me.theme);
-  }catch(e){ location.reload(); }
+  }catch(e){location.reload();}
 }
 
 async function loadUptime(){
@@ -2332,7 +1928,7 @@ async function loadUptime(){
     document.getElementById('uptime').innerHTML='⏱ <b>'+d.human+'</b>';
   }catch(e){}
 }
-setInterval(loadUptime, 1000);
+setInterval(loadUptime,1000);
 
 function fillAccount(me){
   document.getElementById('acName').value=me.full_name||'';
@@ -2342,6 +1938,8 @@ function fillAccount(me){
   document.getElementById('acMin').value=me.default_qr_minutes||15;
   document.getElementById('acTol').value=me.tolerance||0;
   document.getElementById('acHook').value=me.webhook_url||'';
+  document.getElementById('acTgLink').value=me.telegram_bot_link||'';
+  document.getElementById('acWebLink').value=me.website_link||'';
   document.getElementById('emailTxt').textContent=me.email||'-';
   document.getElementById('upiTxt').textContent=me.upi_id||'-';
 }
@@ -2353,139 +1951,36 @@ async function loadDashboard(){
     document.getElementById('stKeys').textContent=d.total_api_keys;
     document.getElementById('stReq').textContent=d.total_requests;
     document.getElementById('stQR').textContent=d.total_qr_generated;
-    
-    const an = await api('/api/analytics');
-    document.getElementById('stToday').textContent = '₹' + an.today.amount.toFixed(0);
-    
-    const ctx = document.getElementById('chart7').getContext('2d');
-    if(chart7Obj) chart7Obj.destroy();
-    chart7Obj = new Chart(ctx, {
-      type: 'bar',
-      data: {
-        labels: an.days_7.map(x=>x.day),
-        datasets: [{
-          label: '₹',
-          data: an.days_7.map(x=>x.amount),
-          backgroundColor: 'rgba(0,255,179,.6)',
-          borderColor: '#00ffb3',
-          borderWidth: 2,
-          borderRadius: 8
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: true, ticks: { color: '#7a7a9a' }, grid: { color: 'rgba(31,31,58,.5)' } },
-          x: { ticks: { color: '#7a7a9a' }, grid: { display: false } }
-        }
-      }
-    });
+    const an=await api('/api/analytics');
+    document.getElementById('stToday').textContent='₹'+an.today.amount.toFixed(0);
+    const ctx=document.getElementById('chart7').getContext('2d');
+    if(chart7Obj)chart7Obj.destroy();
+    chart7Obj=new Chart(ctx,{type:'bar',data:{labels:an.days_7.map(x=>x.day),
+      datasets:[{data:an.days_7.map(x=>x.amount),backgroundColor:'rgba(0,255,179,.6)',
+        borderColor:'#00ffb3',borderWidth:2,borderRadius:8}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+        scales:{y:{beginAtZero:true,ticks:{color:'#7a7a9a'},grid:{color:'rgba(31,31,58,.5)'}},
+          x:{ticks:{color:'#7a7a9a'},grid:{display:false}}}}});
   }catch(e){toast('❌ '+e.message,true)}
-}
-
-function setPeriod(p, el){
-  currentPeriod = p;
-  document.querySelectorAll('.period-tab .tab').forEach(t=>t.classList.remove('active'));
-  el.classList.add('active');
-  loadAnalytics();
 }
 
 async function loadAnalytics(){
   try{
-    const an = await api('/api/analytics');
-    const period = an[currentPeriod];
-    document.getElementById('anAmount').textContent = '₹' + period.amount.toFixed(2);
-    document.getElementById('anCount').textContent = period.count;
-    
-    const pieCtx = document.getElementById('pieChart').getContext('2d');
-    if(pieObj) pieObj.destroy();
-    pieObj = new Chart(pieCtx, {
-      type: 'doughnut',
-      data: {
-        labels: ['Today','Week','Month','Year'],
-        datasets: [{
-          data: [an.today.amount, an.week.amount, an.month.amount, an.year.amount],
-          backgroundColor: ['#00ffb3','#00d4ff','#a855f7','#ff00aa'],
-          borderColor: '#0f0f1e', borderWidth: 3
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: 'bottom', labels: { color: '#7a7a9a', padding: 12 } } }
-      }
-    });
-    
-    const monthCtx = document.getElementById('monthChart').getContext('2d');
-    if(monthObj) monthObj.destroy();
-    monthObj = new Chart(monthCtx, {
-      type: 'line',
-      data: {
-        labels: an.months_12.map(x=>x.month),
-        datasets: [{
-          label: 'Monthly Earnings',
-          data: an.months_12.map(x=>x.amount),
-          borderColor: '#a855f7', backgroundColor: 'rgba(168,85,247,.2)',
-          borderWidth: 3, fill: true, tension: 0.4
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: true, ticks: { color: '#7a7a9a' }, grid: { color: 'rgba(31,31,58,.5)' } },
-          x: { ticks: { color: '#7a7a9a' }, grid: { display: false } }
-        }
-      }
-    });
-    
-    const wdCtx = document.getElementById('weekdayChart').getContext('2d');
-    if(weekdayObj) weekdayObj.destroy();
-    weekdayObj = new Chart(wdCtx, {
-      type: 'bar',
-      data: {
-        labels: an.weekday_dist.map(x=>x.day),
-        datasets: [{
-          label: 'By Weekday',
-          data: an.weekday_dist.map(x=>x.amount),
-          backgroundColor: ['#00ffb3','#00d4ff','#a855f7','#ff00aa','#ffa502','#00e0a4','#ff4757'],
-          borderRadius: 8, borderWidth: 2, borderColor: 'transparent'
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: true, ticks: { color: '#7a7a9a' }, grid: { color: 'rgba(31,31,58,.5)' } },
-          x: { ticks: { color: '#7a7a9a' }, grid: { display: false } }
-        }
-      }
-    });
-    
-    const yCtx = document.getElementById('yearChart').getContext('2d');
-    if(yearObj) yearObj.destroy();
-    yearObj = new Chart(yCtx, {
-      type: 'bar',
-      data: {
-        labels: an.years_5.map(x=>x.year.toString()),
-        datasets: [{
-          label: 'Yearly',
-          data: an.years_5.map(x=>x.amount),
-          backgroundColor: 'rgba(255,0,170,.5)', borderColor: '#ff00aa',
-          borderWidth: 2, borderRadius: 8
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: true, ticks: { color: '#7a7a9a' }, grid: { color: 'rgba(31,31,58,.5)' } },
-          x: { ticks: { color: '#7a7a9a' }, grid: { display: false } }
-        }
-      }
-    });
+    const an=await api('/api/analytics');
+    const period=an[currentPeriod];
+    document.getElementById('anAmount').textContent='₹'+period.amount.toFixed(2);
+    document.getElementById('anCount').textContent=period.count;
+    const ctx=document.getElementById('monthChart').getContext('2d');
+    if(monthObj)monthObj.destroy();
+    monthObj=new Chart(ctx,{type:'line',data:{labels:an.months_12.map(x=>x.month),
+      datasets:[{data:an.months_12.map(x=>x.amount),borderColor:'#a855f7',
+        backgroundColor:'rgba(168,85,247,.2)',borderWidth:3,fill:true,tension:.4}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+        scales:{y:{beginAtZero:true,ticks:{color:'#7a7a9a'},grid:{color:'rgba(31,31,58,.5)'}},
+          x:{ticks:{color:'#7a7a9a'},grid:{display:false}}}}});
   }catch(e){toast('❌ '+e.message,true)}
 }
+function setPeriod(p,el){currentPeriod=p;document.querySelectorAll('.period-tab .tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');loadAnalytics();}
 
 async function saveAccount(){
   try{
@@ -2494,21 +1989,24 @@ async function saveAccount(){
       upi_id:document.getElementById('acUpi').value.trim(),
       mobile:document.getElementById('acMob').value.trim(),
       email:document.getElementById('acEmail').value.trim(),
-      app_password:document.getElementById('acPass').value.trim() || '',
+      app_password:document.getElementById('acPass').value.trim()||'',
       default_qr_minutes:parseInt(document.getElementById('acMin').value)||15,
       tolerance:parseFloat(document.getElementById('acTol').value)||0,
-      webhook_url:document.getElementById('acHook').value.trim()
+      webhook_url:document.getElementById('acHook').value.trim(),
+      telegram_bot_link:document.getElementById('acTgLink').value.trim(),
+      website_link:document.getElementById('acWebLink').value.trim()
     };
     if(!payload.upi_id)return toast('UPI required',true);
     await api('/api/setup-account',{method:'POST',body:JSON.stringify(payload)});
-    toast('✅ Saved'); document.getElementById('acPass').value=''; bootApp();
+    toast('✅ Saved');document.getElementById('acPass').value='';bootApp();
   }catch(e){toast('❌ '+e.message,true)}
 }
-
 async function testEmail(){
   try{
     document.getElementById('testRes').innerHTML='<div style="color:var(--nwarn)">⏳ Testing…</div>';
-    const d=await api('/api/test-email',{method:'POST',body:JSON.stringify({email:document.getElementById('acEmail').value,app_password:document.getElementById('acPass').value})});
+    const d=await api('/api/test-email',{method:'POST',body:JSON.stringify({
+      email:document.getElementById('acEmail').value,
+      app_password:document.getElementById('acPass').value})});
     document.getElementById('testRes').innerHTML=`<div style="background:rgba(0,255,179,.1);border:1px solid rgba(0,255,179,.4);padding:12px;border-radius:10px;color:var(--ng);font-size:13px">${d.message}<br><b>Total:</b> ${d.total_emails||0} | <b>Unseen:</b> ${d.unseen_emails||0}</div>`;
     document.getElementById('emailDot').className='dot on';
   }catch(e){
@@ -2520,73 +2018,64 @@ async function testEmail(){
 function toggleMode(){document.getElementById('daysWrap').style.display=document.getElementById('keyMode').value==='lifetime'?'none':'flex';}
 async function genKey(){
   try{
-    const mode=document.getElementById('keyMode').value;
-    const days=parseInt(document.getElementById('keyDays').value)||30;
-    const rate_limit=parseInt(document.getElementById('keyRate').value)||60;
-    const d=await api('/api/generate-key',{method:'POST',body:JSON.stringify({mode,days,rate_limit,label:document.getElementById('keyLabel').value})});
+    const d=await api('/api/generate-key',{method:'POST',body:JSON.stringify({
+      mode:document.getElementById('keyMode').value,
+      days:parseInt(document.getElementById('keyDays').value)||30,
+      rate_limit:parseInt(document.getElementById('keyRate').value)||60,
+      label:document.getElementById('keyLabel').value})});
     document.getElementById('keyRes').innerHTML=`<div style="background:rgba(0,255,179,.08);border:1px solid rgba(0,255,179,.4);padding:14px;border-radius:10px">
-      <div style="color:var(--ng);font-weight:700;margin-bottom:10px">✅ Key Generated</div>
-      <div class="api-out"><span>QR: ${esc(d.example)}</span><button class="copy" onclick="copyText('${esc(d.example)}')">Copy</button></div>
-      <div class="api-out" style="margin-top:8px"><span>Telegram: ${esc(d.telegram_url)}</span><button class="copy" onclick="window.open('${esc(d.telegram_url)}','_blank')">Open</button></div>
-      <div class="api-out" style="margin-top:8px"><span>Website: ${esc(d.website_url)}</span><button class="copy" onclick="window.open('${esc(d.website_url)}','_blank')">Open</button></div>
+      <div style="color:var(--ng);font-weight:700;margin-bottom:6px">✅ Generated</div>
+      <div class="api-out"><span>${esc(d.example)}</span><button class="copy" onclick="copyText('${esc(d.example)}')">Copy</button></div>
     </div>`;
     loadKeys();
   }catch(e){toast('❌ '+e.message,true)}
 }
 async function loadKeys(){
   try{
-    const list=await api('/api/list-keys'), el=document.getElementById('keysList');
-    if(!list.length){el.innerHTML='<div class="empty"><div class="empty-ic">🔑</div>No keys yet</div>';return}
-    el.innerHTML=list.map(k=>`<div class="txn" style="flex-direction:column;align-items:stretch;gap:8px;padding:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <div><b style="font-family:monospace;font-size:12px">${esc(k.api_key)}</b> ${k.expiry==='LIFETIME'?'<span class="badge life">Lifetime</span>':''}</div>
-        <button class="copy" style="background:rgba(255,71,87,.15);color:var(--dang)" onclick="delKey('${esc(k.api_key)}')">Delete</button>
-      </div>
-      <div class="meta">Requests: ${k.total_requests} · QRs: ${k.total_qr} · Received: ₹${k.total_received} · Rate: ${k.rate_limit}/min</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
-        <span class="integration-pill" onclick="window.open('${esc(k.telegram_url)}','_blank')">🤖 Telegram Integration</span>
-        <span class="integration-pill" onclick="window.open('${esc(k.website_url)}','_blank')">🌐 Website Integration</span>
-        <span class="integration-pill" onclick="copyText('${esc(k.url)}?qr=AMOUNT')">📋 Copy QR URL</span>
-      </div>
+    const list=await api('/api/list-keys'),el=document.getElementById('keysList');
+    if(!list.length){el.innerHTML='<div class="empty"><div class="empty-ic">🔑</div>No keys</div>';return}
+    el.innerHTML=list.map(k=>`<div class="txn" style="flex-direction:column;align-items:stretch;gap:8px">
+      <div style="display:flex;justify-content:space-between"><b style="font-family:monospace;font-size:12px">${esc(k.api_key)}</b>
+      <button class="copy" style="background:rgba(255,71,87,.15);color:var(--dang)" onclick="delKey('${esc(k.api_key)}')">Delete</button></div>
+      <div class="meta">Requests: ${k.total_requests} · QRs: ${k.total_qr} · Received: ₹${k.total_received}</div>
+      <div class="api-out"><span>${esc(k.url)}</span><button class="copy" onclick="copyText('${esc(k.url)}')">Copy</button></div>
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}
 }
-async function delKey(k){
-  if(!confirm('Delete this key?'))return;
-  try{await api('/api/delete-key/'+k,{method:'DELETE'});toast('Deleted');loadKeys()}catch(e){toast('❌ '+e.message,true)}
-}
+async function delKey(k){if(!confirm('Delete?'))return;try{await api('/api/delete-key/'+k,{method:'DELETE'});toast('Deleted');loadKeys()}catch(e){toast('❌ '+e.message,true)}}
+
 async function loadHistory(){
   try{
-    const txns=await api('/api/transactions');
-    const el=document.getElementById('txnList');
-    if(!txns.length){el.innerHTML='<div class="empty"><div class="empty-ic">📜</div>No transactions yet</div>';return}
+    const txns=await api('/api/transactions'),el=document.getElementById('txnList');
+    if(!txns.length){el.innerHTML='<div class="empty"><div class="empty-ic">📜</div>No transactions</div>';return}
     el.innerHTML=txns.map(t=>`<div class="txn">
       <div style="flex:1"><div class="amt">+ ₹${t.amount.toFixed(2)}</div>
       <div class="meta">Txn: ${esc(t.txn_id)||'-'}</div>
       <div class="meta">UTR: ${esc(t.utr)||'-'}</div>
-      <div class="meta">From: ${esc(t.sender_name)||'-'} (${esc(t.sender_upi)||'-'})</div>
-      <div class="meta">${esc(t.email_date)||esc(t.paid_at)}</div></div>
-      <div style="font-size:10px;color:var(--dim);text-align:right;font-family:'Space Mono',monospace">${esc(t.order_id)||''}</div>
+      <div class="meta">From: ${esc(t.sender_upi)||'-'}</div>
+      <div class="meta">${esc(t.email_date)||esc(t.paid_at)}</div>
+      ${t.session_id?`<div class="sess">🔖 ${esc(t.session_id)}</div>`:''}
+      </div>
+      <div style="font-size:10px;color:var(--dim);text-align:right;font-family:monospace">${esc(t.order_id)||''}</div>
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}
 }
 async function loadPartials(){
   try{
-    const ps=await api('/api/partial-payments');
-    const el=document.getElementById('partialList');
-    if(!ps.length){el.innerHTML='<div class="empty"><div class="empty-ic">✨</div>No partial payments — all clean!</div>';return}
+    const ps=await api('/api/partial-payments'),el=document.getElementById('partialList');
+    if(!ps.length){el.innerHTML='<div class="empty"><div class="empty-ic">✨</div>No partials</div>';return}
     el.innerHTML=ps.map(p=>`<div class="txn partial">
       <div><div class="amt">₹${p.received.toFixed(2)} / ₹${p.expected.toFixed(2)}</div>
       <div class="meta">Short by ₹${(p.short_by||0).toFixed(2)} · Txn ${esc(p.txn_id)||'-'}</div>
-      <div class="meta">UTR ${esc(p.utr)||'-'}</div></div>
-      <div style="font-size:11px;color:var(--dim);text-align:right">${esc(p.created_at)}<br>${esc(p.order_id)}</div>
+      ${p.session_id?`<div class="sess">🔖 ${esc(p.session_id)}</div>`:''}
+      </div>
+      <div style="font-size:11px;color:var(--dim);text-align:right">${esc(p.created_at)}</div>
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}
 }
 async function loadAudit(){
   try{
-    const list=await api('/api/audit-log');
-    const el=document.getElementById('auditList');
+    const list=await api('/api/audit-log'),el=document.getElementById('auditList');
     if(!list.length){el.innerHTML='<div class="empty"><div class="empty-ic">🔍</div>No logs</div>';return}
     el.innerHTML=list.map(l=>`<div class="txn"><div><div style="font-weight:700;font-size:12px">${esc(l.action)}</div>
       <div class="meta">${esc(l.details||'')}</div></div>
@@ -2594,35 +2083,10 @@ async function loadAudit(){
     </div>`).join('');
   }catch(e){toast('❌ '+e.message,true)}
 }
-async function loadSettings(){
-  try{
-    const me=await api('/api/me');
-    document.getElementById('themeSel').value = me.theme || 'dark';
-  }catch(e){}
-}
-async function saveSettings(){
-  try{
-    const theme=document.getElementById('themeSel').value;
-    applyTheme(theme);
-    const me=await api('/api/me');
-    await api('/api/setup-account',{method:'POST',body:JSON.stringify({
-      full_name:me.full_name,upi_id:me.upi_id,mobile:me.mobile,
-      email:me.email,default_qr_minutes:me.default_qr_minutes,
-      tolerance:me.tolerance,webhook_url:me.webhook_url,theme
-    })});
-    toast('✅ Settings saved');
-  }catch(e){toast('❌ '+e.message,true)}
-}
 
 (async()=>{try{await api('/api/me');bootApp()}catch{}})();
 </script></body></html>
 """
-
-@app.route('/')
-def home(): return render_template_string(MAIN_HTML)
-
-@app.route('/health')
-def health(): return jsonify({"status":"ok", "version":APP_VERSION, "time": time.time()})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
